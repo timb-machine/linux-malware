@@ -1,0 +1,741 @@
+<!doctype html>
+<!--
+  Minimal Mistakes Jekyll Theme 4.22.0 by Michael Rose
+  Copyright 2013-2020 Michael Rose - mademistakes.com | @mmistakes
+  Free for personal and commercial use under the MIT license
+  https://github.com/mmistakes/minimal-mistakes/blob/master/LICENSE
+-->
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8">
+
+<!-- begin _includes/seo.html --><title>APT Encounters of the Third Kind - Igor’s Blog</title>
+<meta name="description" content="A few weeks ago an ordinary security assessment turned into an incident response whirlwind. It was definitely a first for me, and I was kindly granted permission to outline the events in this blog post. This investigation started scary but turned out be quite fun, and I hope reading it will be informative to you too.  I&#39;ll be back to posting about my hardware research soon.     How it started   What hell is this?   The NFS Server   2nd malicious binary   Further forensics   Eureka Moment   The GOlang thingy   How the kernel got patched? and why not the golang app?   What we have so far   Q&amp;A   How it started Twice a year I am hired to do security assessments for a specific client. We have been working together for several years, and I had a pretty good understanding of their network and what to look for.  This time my POC, Klaus, asked me to focus on privacy issues and GDPR compliance. However, he asked me to first look at their cluster of reverse gateways / load balancers:    I had some prior knowledge of these gateways, but decided to start by creating my own test environment first. The gateways run a custom Linux stack: basically a monolithic compiled kernel (without any modules), and a static GOlang application on top. The 100+ machines have no internal storage, but rather boot from an external USB media that has the kernel and the application. The GOlang app serves in two capacities: an init replacement and the reverse gateway software. During initialization it mounts /proc, /sys, devfs and so on, then mounts an NFS share hardcoded in the app. The NFS share contains the app&#39;s configuration, TLS certificates, blacklist data and a few more. It starts listening on 443, filters incoming communication and passes valid requests on different services in the production segment.    I set up a self contained test environment, and spent a day in black box examination. Having found nothing much I suggested we move on to looking at the production network, but Klaus insisted I continue with the gateways. Specifically he wanted to know if I could develop a methodology for testing if an attacker has gained access to the gateways and is trying to access PII (Personally Identifiable Information) from within the decrypted HTTP stream.  I couldn&#39;t SSH into the host (no SSH), so I figured we will have to add some kind of instrumentation to the GO app. Klaus still insisted I start by looking at the traffic before (red) and after the GW (green), and gave me access to a mirrored port on both sides so I could capture traffic to a standalone laptop he prepared for me and I could access through an LTE modem but was not allowed to upload data from:    The problem I faced now was how to find out what HTTPS traffic corresponded to requests with embedded PII. One possible avenue was to try and correlate the encrypted traffic with the decrypted HTTP traffic. This proved impossible using timing alone. However, unspecting the decoded traffic I noticed the GW app adds an &#39;X-Orig-Connection&#39; with the four-tuple of the TLS connection! Yay!    I wrote a small python program to scan the port 80 traffic capture and create a mapping from each four-tuple TLS connection to a boolean - True for connection with PII and False for all others: 10.4.254.254,443,[Redacted],43404,376106847.319,False 10.4.254.254,443,[Redacted],52064,376106856.146,False 10.4.254.254,443,[Redacted],40946,376106856.295,False 10.4.254.254,443,[Redacted],48366,376106856.593,False 10.4.254.254,443,[Redacted],48362,376106856.623,True 10.4.254.254,443,[Redacted],45872,376106856.645,False 10.4.254.254,443,[Redacted],40124,376106856.675,False  ...   With this in mind I could now extract the data from the PCAPs and do some correlations. After a few long hours getting scapy to actually parse timestamps consistently enough for comparisons, I had a list of connection timing information correlated with PII. A few more fun hours with Excel and I got histogram graphs of time vs count of packets. Everything looked normal for the HTTP traffic, although I expected more of a normal distribution than the power-low type thingy I got. Port 443 initially looked the same, and I got the normal distribution I expected. But when filtering for PII something was seriously wrong. The distribution was skewed and shifted to longer time frames. And there was nothing similar on the port 80 end.    My only explanation was that something was wrong with my testing setup (the blue bars) vs. the real live setup (the orange bars). I wrote on our slack channel &#39;I think my setup is sh*t, can anyone resend me the config files?&#39;, but this was already very late at night, and no one responded. Having a slight OCD I couldn’t let this go. To my rescue came another security? feature of the GWs: Thet restarted daily, staggered one by one, with about 10 minutes between hosts. This means that every ten minutes or so one of them would reboot, and thus reload it’s configuration files over NFS. And since I could see the NFS traffic through the port mirror I had access to, I recokoned I could get the production configuration files from the NFS capture (bottom dotted blue line in the diagram before).  So to cut a long story short I found the NFS read reply packet, and got the data I need. But … why the hack is eof 77685??? Come on people, its 3:34AM!  What&#39;s more, the actual data was 77685 bytes, exactly 8192 bytes more then the ‘Read length’. The entropy for that data was pretty uniform, suggesting it was encrypted. The file I had was definitely not encrypted.    Histogram of extra 8192 bytes:    When I mounted the NFS export myself I got a normal EOF value of 1!    What hell is this?  Comparing the capture from my testing machine with the one from the port mirror I saw something else weird:    For other NFS open requests (on all of my test system captures and for other files in the production system) we get:    Spot the difference?  The open id: string became open-id:. Was I dealing with some corrupt packet? But the exact same problem reappeared the next time blacklist.db was send over the wire by another GW host.  Time to look at the kernel source code:    The “open id” string is hardcoded. What&#39;s up?  After a good night sleep and no beer this time I repeated the experiment and convincing myself I was not hullucinating I decided to compare the source code of the exact kernel version with the kernel binary I got.  What I expected to see was this (from nfs4xdr.c):  static inline void encode_openhdr(struct xdr_stream *xdr, const struct nfs_openargs *arg) {     __be32 *p;  /*  * opcode 4, seqid 4, share_access 4, share_deny 4, clientid 8, ownerlen 4,  * owner 4 = 32  */     encode_nfs4_seqid(xdr, arg-&gt;seqid);     encode_share_access(xdr, arg-&gt;share_access);     p = reserve_space(xdr, 36);     p = xdr_encode_hyper(p, arg-&gt;clientid);     *p++ = cpu_to_be32(24);     p = xdr_encode_opaque_fixed(p, &quot;open id:&quot;, 8);     *p++ = cpu_to_be32(arg-&gt;server-&gt;s_dev);     *p++ = cpu_to_be32(arg-&gt;id.uniquifier);     xdr_encode_hyper(p, arg-&gt;id.create_time); }   Running binwalk -e -M bzImage I got the internal ELF image, and opened it in IDA. Of course I didn’t have any symbols, but I got nfs4_xdr_enc_open() from /proc/kallsyms, and from there to encode_open() which led me to encode_openhdr(). With some help from hex-rays I got code that looked very similiar, but with one key difference:  static inline void encode_openhdr(struct xdr_stream *xdr, const struct nfs_openargs *arg) {     ...     p = xdr_encode_opaque_fixed(p, unknown_func(&quot;open id:&quot;, arg), 8);     ... }   The function unknown_func was pretty long and complicated but eventually sometimes decided to replace the space between &#39;open&#39; and &#39;id&#39; with a hyphen.  Does the NFS server care? Apparently this string it is some opaque client identifier that is ignored by the NFS server, so no one would see the difference. That is unless they were trying to extract something from an NFS stream, and obviously this was not a likely scenario. OK, back to the weird &#39;eof&#39; thingy from the NFS server.  The NFS Server  The server was running the &#39;NFS-ganesha-3.3&#39; package. This is a very modular user-space NFS server that is implemented as a series of loadable modules called FSALs. For example support for files on the regular filesystem is implemented through a module called libfsalvfs.so. Having verified all the files on disk had the same SHA1 as the distro package, I decided to dump the process memory. I didn&#39;t have any tools on the host, so I used GDB which helpfully was already there. Unexpectadly GDB was suddenly killed, the file I specified as output got erased, and the nfs server process restarted.  I took the dump again but there was nothing special there!  I was pretty suspicious at this time, and wanted to recover the original dump file from the first dump. Fortunately for me I was dumping the file to the laptop, again over NFS. The file had been deleted, but I managed to recover it from the disk on that server.  2nd malicious binary  The memory dump was truncated, but had a corrupt version of NFS-ganesha inside. There were two libfsalvfs.so libraries loaded: the original one and an injected SO file with the same name. The injected file was clearly malicious. The main binary was patched in a few places, and the  function table into libfsalvfs.so as replaced with the alternate libfsalvfs.so. The alternate file was compiled from NFS-ganesha sources, but modified to include new and improved (wink wink) functionality.  The most interesting of the new functionality were two separate implementations of covert channels.  The first one we encountered already:     When an open request comes in with &#39;open-id&#39; instead of &#39;open id&#39;, the file handle is marked. This change is opaque to the NFS server, so unpatched servers just ignore it and nothing much happens.   For infiltrated NFS server, when the file handle opened this way is read, the NFS server appends the last block with a payload coming from the malware&#39;s runtime storage, and the &#39;eof&#39; on-the-wire value is changed to be the new total size. An unpatched kernel (which shouldn’t really happen, since it marked the file in the first place) will just ignore the extra bytes. The EOF value is used as a bool, e.g. checked for 0 or not and not a specific value, so having a large integer values doesn’t change anything in the flow of an unmodified kernel.   The second covert channel is used for command and control, and is implemented in the VFS code as a fake directory.  Any writes to /&lt;export&gt;/.snapshot/meta/&lt;cmdid&gt; are handled by the malware code and not passed on to the FS. They are pseudo-files that implement commands through read and write operations.  The malware implemented the following commands:    1701 - self destruct   1702 - set auto self destruct time   1703 - run shell command   1704 - load SO file from buffer specified in command   1706 - get basic system description   1707 - get network connections   170A - upgrade to new SO file   74201 - put buffer in memory dict by ID   74202 - get buffer from memory dict by ID   74650 - put a payload in memory for the first covert channel   74651 - arm the first covert channel   74652 - disarm the first covert channel   For example cp payload.so /mnt/server/.snapshot/meta/1704 will load the SO file in the NFS ganesha process on the target server, and echo 1616580589 &gt; /mnt/server/.snapshot/meta/1702 will set an autodestruct time. Reading this file will retrieve the time.  The self destruct command (0x1701) is very interesting - it sends a UDP broadcast on port 41701 with a random payload of size 321 bytes, and then restarts a clean NFS-ganesha. I guess this is some kind of network signalling.  It appears the malware has a watchdog that iterates over all /proc/&lt;pid&gt;/fd/* links every 25ms, and if a link is open to /proc/&lt;malware pid&gt;/maps or /proc/&lt;malware pid&gt;/smaps or  /proc/&lt;malware pid&gt;/mem it:    kills the offending process,   deletes any writeable file handle it had opened (before it was killed) in /proc/&lt;pid&gt;/fd/, first trying to wipe it,   calls the self destruct command (0x1701).   Further forensics Lets go back to that awful Saturday I triggered the self-destruct. Having a faint understanding I triggered something (that being before I reversed the devil) I asked Klaus to disconnect all the network connections to the outer world and we started taking memory dumps of whatever we could, storing them all on the laptop. In hindsight we destroyed quiet a bit of evidence by triggering more self destructs in other subnets, but I think the self destruct signal has already gone out to the bad guys through a different piece of malware that I later partially recovered, and probably &quot;heard&quot; the UDP distress signal (that&#39;s what is was called in the binary, not my naming).  After getting all the forensics the client insisted on reconnecting his systems to the web, they were &quot;losing money&quot;. I switched from forensics to reversing.  In the process, while inspecting the malicious libfsalvfs.so I discovered the commands I mentioned above, and discovered a &quot;feature&quot; that helped me fill more paces of the puzzle.  Reversing malware you always find some feeble attempt to obfuscate string using XOR or RC4, or just scrambling the letter ordering. In this case I pretty quickly found a function I called get_obfuscated_string(buffer, string_id). The difference however, was that this one was just horrendous, practically irreversible:    It had like a billion nested switches:    I think they let some intern fresh out of college write that one. It seems the complete list of strings used by the tool are encoded inside in a tree of nested switches, with a variable length encoding, e.g. in one branch the 2nd level might have 3 bits and in another it might have 5 and in a third only a single bit. Some kind of prefix tree if I remember anything from Uni.  Eventually I managed to write code to just brute force the function: #include &lt;stdio.h&gt; #include &lt;stdlib.h&gt; #include &lt;sys/mman.h&gt; #include &lt;sys/types.h&gt; #include &lt;sys/stat.h&gt; #include &lt;fcntl.h&gt; #include &lt;unistd.h&gt; #include &lt;string&gt; #include &lt;set&gt;  int main(int argc, char* argv[]) { 	// error handling code omitted 	const char* filename = (argc &gt; 1) ? argv[1] : &quot;reconstructed.elf&quot;; 	unsigned long offset = (argc &gt; 1) ? strtol(argv[2], NULL, 16) : 0x22a0;  	int fd = open(filename, O_RDONLY); 	struct stat stbuf; 	fstat(fd, &amp;stbuf); 	const char* addr = (char*)mmap(NULL, stbuf.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0); 	close(fd); 	const char* base = addr + offset;  	typedef int (*entry_t)(char* outbuf, int id); 	entry_t entry = (entry_t)base; 	std::set&lt;std::string&gt; found; 	char buffer[1024]; 	 	for(long bits = 1; bits &lt; 64; ++ bits) { 		bool any_new = false; 		for(long id = (bits == 1) ? 0 : (1 &lt;&lt; (bits - 1)); id &lt; (1&lt;&lt;bits); ++ id) { 			int status = entry(buffer, id); 			if(status == 0) 				continue; 			if(found.find(buffer) != found.end()) 				continue; 			found.insert(buffer); 			printf(&quot;Got &#39;%s&#39;! [0x%x]\n&quot;, buffer, id); 			any_new = true; 		} 		if(!any_new) 			break; 	}  	return 0; }   This first binary had the following strings (I am keeping 3 to myself as they have client related info):  &#39;/proc/self/mem&#39;,  &#39;/proc/self/maps&#39;, &#39;/proc/self/cwd&#39;, &#39;/proc/self/environ&#39;, &#39;/proc/self/fd/%d&#39;, &#39;/proc/self/fdinfo/%d&#39;, &#39;/proc/self/limits&#39;, &#39;/proc/self/cgroup&#39;, &#39;/proc/self/exe&#39;, &#39;/proc/self/cmdline&#39;, &#39;/proc/self/mounts&#39;, &#39;/proc/self/smaps&#39;, &#39;/proc/self/stat&#39;, &#39;/proc/%d/mem&#39;,  &#39;/proc/%d/maps&#39;, &#39;/proc/%d/cwd&#39;, &#39;/proc/%d/environ&#39;, &#39;/proc/%d/fd/%d&#39;, &#39;/proc/%d/fdinfo/%d&#39;, &#39;/proc/%d/limits&#39;, &#39;/proc/%d/cgroup&#39;, &#39;/proc/%d/exe&#39;, &#39;/proc/%d/cmdline&#39;, &#39;/proc/%d/mounts&#39;, &#39;/proc/%d/smaps&#39;, &#39;/proc/%d/stat&#39;,         &#39;nfs&#39;, &#39;nfs4&#39;, &#39;tmpfs&#39;, &#39;devtmpfs&#39;, &#39;procfs&#39;, &#39;sysfs&#39;, &#39;WSL2&#39;, &#39;/etc/os-release&#39;, &#39;/etc/passwd&#39;, &#39;/etc/lsb-release&#39;, &#39;/etc/debian_version&#39;, &#39;/etc/redhat-release&#39;, &#39;/home/%s/.ssh&#39;, &#39;/var/log/wtmp&#39;, &#39;/var/log/syslog&#39;, &#39;/var/log/auth.log&#39;, &#39;/var/log/cron.log&#39;, &#39;/var/log/syslog.log&#39;, &#39;/etc/netplan/*.yaml&#39;, &#39;/etc/yp.conf&#39;, &#39;/var/yp/binding/&#39;, &#39;/etc/krb5.conf&#39;, &#39;/var/kerberos/krb5kdc/kdc.conf&#39;, &#39;/var/log/ganesha.log&#39;, &#39;/etc/ganesha/ganesha.conf&#39;, &#39;/etc/ganesha/exports&#39;, &#39;/etc/exports&#39;, &#39;Error: init failed&#39;, &#39;DELL&#39;, &#39;/usr/lib/x86_64-linux-gnu/libnfs.so.4&#39;, &#39;/tmp/.Test-unix/.fa76c5adb8c04239ff3034106842773b&#39;, &#39;Error: config missing&#39;, &#39;Error: sysdep missing&#39;, &#39;Running&#39;, &#39;LOG&#39;, &#39;/usr/lib/x86_64-linux-gnu/ganesha/libfsalvfs.so&#39;, &#39;none&#39;, &#39;/etc/sudoers&#39;, &#39;/proc/net/tcp&#39;, &#39;/proc/net/udp&#39;, &#39;/etc/selinux/config&#39;, &#39;libdl.so.2&#39;, &#39;libc-&#39;, &#39;.so&#39;, &#39;cluster-config&#39;, &#39;recovery-signal&#39;,   Eureka Moment Staring endlessly at this weird function I thought to myself: maybe I can look for code that is structured like this in all the dumps we obtained. We have all those block of mov byte ptr [rdi+?], &#39;?&#39;:    So lets look for blocks of code that are highly dense with these opcodes:  import sys  with open(sys.argv[1], &#39;rb&#39;) as f:     data = f.read()  STATE=None for i in range(len(data) - 6):     if ord(data[i]) == 0xc6 and ord(data[i + 1]) == 0x47:         if STATE and (STATE[0] + STATE[1] + 0x40) &gt;= i:             STATE[1] = i - STATE[0]             STATE[2] += 1         else:             if STATE and STATE[2] &gt;= 20:                 print(&#39;Found region at 0x%x - 0x%x&#39; % (STATE[0], STATE[0] + STATE[1]))             STATE = [i, 4, 1]    And I found them. Oh I did. Some adjustment even led to a version for ARM systems:    The GOlang thingy  I finally found the payload that was sent over to the GW machines. It had 2 stages: the first was the 8192 buffer loaded through the first covert channel. The kernel was modified to inject this buffer into the GOlang application and hook it. This will get fairly technical, but I enjoyed it and so will you:     First note that in the Golang stdlib an HTTP connection can be read through the net/http.(connReader).Read function. The calls are made through a io.Reader interface, so the calls are made through a virtual table, and the call locations cannot be statically identified.   the kernel inject begins by allocating a bunch of RWX memory immediately after the GOlang binary - let&#39;s call it the trampoline area, and it will include two types of generated trampoline functions,   Next the ELF symbol table was used to find the &#39;net/http.(*connReader).Read&#39; symbol,   What we’ll call the 1st trampoline function (code below) is copied to the trampoline area, patching the area marked with HERE with the first 9 bytes of net/http.(\*connReader).Read   mprotect(net_http_connReader_read &amp; ~0xfff, 8192, PROT_EXEC | PROT_READ | PROT_WRITE)   modified the beginning of net/http.(\*connReader).Read to a near jump into the trampoline - using 5 bytes of the 9 original used by &#39;move rcx, fs:….&#39; that are the preamble to function.   First trampoline function      pop     rax                  pop     rcx      push    rcx      push    rax      mov     r11, cs:qword_&lt;relocated&gt;      mov     rdi, rcx      call    qword ptr [r11+8]      pop     rax      pop     rcx      push    rcx      mov     rcx, fs:0FFFFFFFFFFFFFFF8h &lt;---- HERE      cmp     rsp, [rcx+10h]      jmp     rax      When the trampoline is called (from the new near jump in the beginning of net/http.(*connReader).Read) it examines the stack to locate the return address, and checks if a second type of trampoline we&#39;ll refer to as the return trampoline has already been allocated for the return address for the function,   If not it allocates a new trampoline per call location of net/http.(*connReader).Read from the code below, replacing 123456789ABCDEFh with the absolute address of a function in the malware,   GOlang uses memory for all function argument passing, so immediately after the virtual function call to Read() there will always be a 5 byte mov     reg, [rsp+?] to load Read()&#39;s result into a register. This mov instruction is copied into the first db 5 dup(0) area,   those same 5 bytes are then replacing with a near jump to the 2nd trampoline   the 2nd db 5 dup(0) are filled with a relative near jmp back to the original code patch site.         mov     rax, 123456789ABCDEFh     mov     rdi, rsp     call    rax     db 5 dup(0)     db 5 dup(0)                 This way eventually all the net/http.(*connReader).Read call sites are patched to call a function immediatly after net/http.(*connReader).Read virtual call returns. This lets the malicous code inspect the decoded HTTP packet.  On initialization the 1st stage malware also loads the hefty 2nd stage through the 2nd covert channel, and passes each buffer received from the patch on net/http.(*connReader).Read to it for inspection. The data collected is collected and compressed by the malware and stored back to the NFS server (the 2nd covert channel which bypasses read ACLs on NFS).  Before this case I did not think there was any nice way to hook random GO binaries, this technique is pretty cool.  Unfortunatly I cannot discuss what the 2nd payload actually as it will reveal stuff my employer isn&#39;t ready for yet.  How the kernel got patched? and why not the golang app? The golang app is built inside the CI/CD network segment. This segment can only be accessed through monitored jump hosts with MFA. Each day, the CI/CD pipline clones the source code from the GIT server, builds it, and automatically tests it in a pre-production segment. Once tested it gets digitally signed and uploaded to the NFS server. The running app self updates, checking the digital signature beforehand.  The kernel, on the other hand, is manually built by the guy responsible for it on his own laptop. He then digitally signs it and stores it on a server where it is used by the CI/CD pipeline. Fortunatly for us a commented out line in a script in the CI/CD pipline (a line that was not commented out in the GIT!) did not delete old versions of the kernel and we know which versions were tampered with.  We noticed a 3 month gap about 5 month ago, and it corresponded with the guy moving the kernel build from a Linux laptop to a new Windows laptop with a VirtualBox VM in it for compiling the kernel. It looks as if it took the attackers three months to gain access back into the box and into the VM build.  What we have so far  We found a bunch of malware sitting in the network collecting PII information from incoming HTTPS connection after they are decoded in a GOlang app. The data is exfiltrated through the malware network and eventually is sent to the bad guys. We have more info but I am still working on it, expect another blog post in the future with more details, samples, etc’.  Q&amp;A          Q: What was the initial access vector?      A: We have a pretty good idea, but I cannot publish it yet (RD and stuff). Stay tuned!           Q: Why didn&#39;t you upload anything to VT yet?      A: A few reasons:            I need to make sure no client info is in the binaries - some of the binaries have hardcoded strings that cannot be shared       All of the binaries I have have been reconstructed from memory dumps, so are not in their original form. Does anyone know how to upload partial dumps into VT?                Q: It there a security vulnerability in GO? in the Kernel?      A: Defenitly not! this is just an obnoxious attacker doing what obnoxious attacker do. I might even say the complexity of the stuff means they don’t have a 0day for this platform.           Q: What about YARA rules, C2 address, etc&#39;?      A: Wait for it, there is a lot more coming!           Q: Why did you publish instead of collecting more?      A: To quote the client &quot;I don&#39;t care who else they are attacking. I just want them off my lawn!&quot;, and he thinks publishing will prevent them from returning to THIS network.     Hopefully what we publish next time will get them off other people’s lawns.           Q: Any Windows malware?      A: Definitly, including what we believe is an EDR bypass. Still working on it.           Q: Any zero days?      A: Maybe …           Q: Who are these bad guys you keep refering to?      A: No clue. Didn’t find anything similiar published. There is now sure way to make anything except unsubstantiated guesses, and I won’t do that.      To be continued.">
+
+
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="en_US">
+<meta property="og:site_name" content="Igor's Blog">
+<meta property="og:title" content="APT Encounters of the Third Kind">
+<meta property="og:url" content="https://igor-blue.github.io/2021/03/24/apt1.html">
+
+
+  <meta property="og:description" content="A few weeks ago an ordinary security assessment turned into an incident response whirlwind. It was definitely a first for me, and I was kindly granted permission to outline the events in this blog post. This investigation started scary but turned out be quite fun, and I hope reading it will be informative to you too.  I&#39;ll be back to posting about my hardware research soon.     How it started   What hell is this?   The NFS Server   2nd malicious binary   Further forensics   Eureka Moment   The GOlang thingy   How the kernel got patched? and why not the golang app?   What we have so far   Q&amp;A   How it started Twice a year I am hired to do security assessments for a specific client. We have been working together for several years, and I had a pretty good understanding of their network and what to look for.  This time my POC, Klaus, asked me to focus on privacy issues and GDPR compliance. However, he asked me to first look at their cluster of reverse gateways / load balancers:    I had some prior knowledge of these gateways, but decided to start by creating my own test environment first. The gateways run a custom Linux stack: basically a monolithic compiled kernel (without any modules), and a static GOlang application on top. The 100+ machines have no internal storage, but rather boot from an external USB media that has the kernel and the application. The GOlang app serves in two capacities: an init replacement and the reverse gateway software. During initialization it mounts /proc, /sys, devfs and so on, then mounts an NFS share hardcoded in the app. The NFS share contains the app&#39;s configuration, TLS certificates, blacklist data and a few more. It starts listening on 443, filters incoming communication and passes valid requests on different services in the production segment.    I set up a self contained test environment, and spent a day in black box examination. Having found nothing much I suggested we move on to looking at the production network, but Klaus insisted I continue with the gateways. Specifically he wanted to know if I could develop a methodology for testing if an attacker has gained access to the gateways and is trying to access PII (Personally Identifiable Information) from within the decrypted HTTP stream.  I couldn&#39;t SSH into the host (no SSH), so I figured we will have to add some kind of instrumentation to the GO app. Klaus still insisted I start by looking at the traffic before (red) and after the GW (green), and gave me access to a mirrored port on both sides so I could capture traffic to a standalone laptop he prepared for me and I could access through an LTE modem but was not allowed to upload data from:    The problem I faced now was how to find out what HTTPS traffic corresponded to requests with embedded PII. One possible avenue was to try and correlate the encrypted traffic with the decrypted HTTP traffic. This proved impossible using timing alone. However, unspecting the decoded traffic I noticed the GW app adds an &#39;X-Orig-Connection&#39; with the four-tuple of the TLS connection! Yay!    I wrote a small python program to scan the port 80 traffic capture and create a mapping from each four-tuple TLS connection to a boolean - True for connection with PII and False for all others: 10.4.254.254,443,[Redacted],43404,376106847.319,False 10.4.254.254,443,[Redacted],52064,376106856.146,False 10.4.254.254,443,[Redacted],40946,376106856.295,False 10.4.254.254,443,[Redacted],48366,376106856.593,False 10.4.254.254,443,[Redacted],48362,376106856.623,True 10.4.254.254,443,[Redacted],45872,376106856.645,False 10.4.254.254,443,[Redacted],40124,376106856.675,False  ...   With this in mind I could now extract the data from the PCAPs and do some correlations. After a few long hours getting scapy to actually parse timestamps consistently enough for comparisons, I had a list of connection timing information correlated with PII. A few more fun hours with Excel and I got histogram graphs of time vs count of packets. Everything looked normal for the HTTP traffic, although I expected more of a normal distribution than the power-low type thingy I got. Port 443 initially looked the same, and I got the normal distribution I expected. But when filtering for PII something was seriously wrong. The distribution was skewed and shifted to longer time frames. And there was nothing similar on the port 80 end.    My only explanation was that something was wrong with my testing setup (the blue bars) vs. the real live setup (the orange bars). I wrote on our slack channel &#39;I think my setup is sh*t, can anyone resend me the config files?&#39;, but this was already very late at night, and no one responded. Having a slight OCD I couldn’t let this go. To my rescue came another security? feature of the GWs: Thet restarted daily, staggered one by one, with about 10 minutes between hosts. This means that every ten minutes or so one of them would reboot, and thus reload it’s configuration files over NFS. And since I could see the NFS traffic through the port mirror I had access to, I recokoned I could get the production configuration files from the NFS capture (bottom dotted blue line in the diagram before).  So to cut a long story short I found the NFS read reply packet, and got the data I need. But … why the hack is eof 77685??? Come on people, its 3:34AM!  What&#39;s more, the actual data was 77685 bytes, exactly 8192 bytes more then the ‘Read length’. The entropy for that data was pretty uniform, suggesting it was encrypted. The file I had was definitely not encrypted.    Histogram of extra 8192 bytes:    When I mounted the NFS export myself I got a normal EOF value of 1!    What hell is this?  Comparing the capture from my testing machine with the one from the port mirror I saw something else weird:    For other NFS open requests (on all of my test system captures and for other files in the production system) we get:    Spot the difference?  The open id: string became open-id:. Was I dealing with some corrupt packet? But the exact same problem reappeared the next time blacklist.db was send over the wire by another GW host.  Time to look at the kernel source code:    The “open id” string is hardcoded. What&#39;s up?  After a good night sleep and no beer this time I repeated the experiment and convincing myself I was not hullucinating I decided to compare the source code of the exact kernel version with the kernel binary I got.  What I expected to see was this (from nfs4xdr.c):  static inline void encode_openhdr(struct xdr_stream *xdr, const struct nfs_openargs *arg) {     __be32 *p;  /*  * opcode 4, seqid 4, share_access 4, share_deny 4, clientid 8, ownerlen 4,  * owner 4 = 32  */     encode_nfs4_seqid(xdr, arg-&gt;seqid);     encode_share_access(xdr, arg-&gt;share_access);     p = reserve_space(xdr, 36);     p = xdr_encode_hyper(p, arg-&gt;clientid);     *p++ = cpu_to_be32(24);     p = xdr_encode_opaque_fixed(p, &quot;open id:&quot;, 8);     *p++ = cpu_to_be32(arg-&gt;server-&gt;s_dev);     *p++ = cpu_to_be32(arg-&gt;id.uniquifier);     xdr_encode_hyper(p, arg-&gt;id.create_time); }   Running binwalk -e -M bzImage I got the internal ELF image, and opened it in IDA. Of course I didn’t have any symbols, but I got nfs4_xdr_enc_open() from /proc/kallsyms, and from there to encode_open() which led me to encode_openhdr(). With some help from hex-rays I got code that looked very similiar, but with one key difference:  static inline void encode_openhdr(struct xdr_stream *xdr, const struct nfs_openargs *arg) {     ...     p = xdr_encode_opaque_fixed(p, unknown_func(&quot;open id:&quot;, arg), 8);     ... }   The function unknown_func was pretty long and complicated but eventually sometimes decided to replace the space between &#39;open&#39; and &#39;id&#39; with a hyphen.  Does the NFS server care? Apparently this string it is some opaque client identifier that is ignored by the NFS server, so no one would see the difference. That is unless they were trying to extract something from an NFS stream, and obviously this was not a likely scenario. OK, back to the weird &#39;eof&#39; thingy from the NFS server.  The NFS Server  The server was running the &#39;NFS-ganesha-3.3&#39; package. This is a very modular user-space NFS server that is implemented as a series of loadable modules called FSALs. For example support for files on the regular filesystem is implemented through a module called libfsalvfs.so. Having verified all the files on disk had the same SHA1 as the distro package, I decided to dump the process memory. I didn&#39;t have any tools on the host, so I used GDB which helpfully was already there. Unexpectadly GDB was suddenly killed, the file I specified as output got erased, and the nfs server process restarted.  I took the dump again but there was nothing special there!  I was pretty suspicious at this time, and wanted to recover the original dump file from the first dump. Fortunately for me I was dumping the file to the laptop, again over NFS. The file had been deleted, but I managed to recover it from the disk on that server.  2nd malicious binary  The memory dump was truncated, but had a corrupt version of NFS-ganesha inside. There were two libfsalvfs.so libraries loaded: the original one and an injected SO file with the same name. The injected file was clearly malicious. The main binary was patched in a few places, and the  function table into libfsalvfs.so as replaced with the alternate libfsalvfs.so. The alternate file was compiled from NFS-ganesha sources, but modified to include new and improved (wink wink) functionality.  The most interesting of the new functionality were two separate implementations of covert channels.  The first one we encountered already:     When an open request comes in with &#39;open-id&#39; instead of &#39;open id&#39;, the file handle is marked. This change is opaque to the NFS server, so unpatched servers just ignore it and nothing much happens.   For infiltrated NFS server, when the file handle opened this way is read, the NFS server appends the last block with a payload coming from the malware&#39;s runtime storage, and the &#39;eof&#39; on-the-wire value is changed to be the new total size. An unpatched kernel (which shouldn’t really happen, since it marked the file in the first place) will just ignore the extra bytes. The EOF value is used as a bool, e.g. checked for 0 or not and not a specific value, so having a large integer values doesn’t change anything in the flow of an unmodified kernel.   The second covert channel is used for command and control, and is implemented in the VFS code as a fake directory.  Any writes to /&lt;export&gt;/.snapshot/meta/&lt;cmdid&gt; are handled by the malware code and not passed on to the FS. They are pseudo-files that implement commands through read and write operations.  The malware implemented the following commands:    1701 - self destruct   1702 - set auto self destruct time   1703 - run shell command   1704 - load SO file from buffer specified in command   1706 - get basic system description   1707 - get network connections   170A - upgrade to new SO file   74201 - put buffer in memory dict by ID   74202 - get buffer from memory dict by ID   74650 - put a payload in memory for the first covert channel   74651 - arm the first covert channel   74652 - disarm the first covert channel   For example cp payload.so /mnt/server/.snapshot/meta/1704 will load the SO file in the NFS ganesha process on the target server, and echo 1616580589 &gt; /mnt/server/.snapshot/meta/1702 will set an autodestruct time. Reading this file will retrieve the time.  The self destruct command (0x1701) is very interesting - it sends a UDP broadcast on port 41701 with a random payload of size 321 bytes, and then restarts a clean NFS-ganesha. I guess this is some kind of network signalling.  It appears the malware has a watchdog that iterates over all /proc/&lt;pid&gt;/fd/* links every 25ms, and if a link is open to /proc/&lt;malware pid&gt;/maps or /proc/&lt;malware pid&gt;/smaps or  /proc/&lt;malware pid&gt;/mem it:    kills the offending process,   deletes any writeable file handle it had opened (before it was killed) in /proc/&lt;pid&gt;/fd/, first trying to wipe it,   calls the self destruct command (0x1701).   Further forensics Lets go back to that awful Saturday I triggered the self-destruct. Having a faint understanding I triggered something (that being before I reversed the devil) I asked Klaus to disconnect all the network connections to the outer world and we started taking memory dumps of whatever we could, storing them all on the laptop. In hindsight we destroyed quiet a bit of evidence by triggering more self destructs in other subnets, but I think the self destruct signal has already gone out to the bad guys through a different piece of malware that I later partially recovered, and probably &quot;heard&quot; the UDP distress signal (that&#39;s what is was called in the binary, not my naming).  After getting all the forensics the client insisted on reconnecting his systems to the web, they were &quot;losing money&quot;. I switched from forensics to reversing.  In the process, while inspecting the malicious libfsalvfs.so I discovered the commands I mentioned above, and discovered a &quot;feature&quot; that helped me fill more paces of the puzzle.  Reversing malware you always find some feeble attempt to obfuscate string using XOR or RC4, or just scrambling the letter ordering. In this case I pretty quickly found a function I called get_obfuscated_string(buffer, string_id). The difference however, was that this one was just horrendous, practically irreversible:    It had like a billion nested switches:    I think they let some intern fresh out of college write that one. It seems the complete list of strings used by the tool are encoded inside in a tree of nested switches, with a variable length encoding, e.g. in one branch the 2nd level might have 3 bits and in another it might have 5 and in a third only a single bit. Some kind of prefix tree if I remember anything from Uni.  Eventually I managed to write code to just brute force the function: #include &lt;stdio.h&gt; #include &lt;stdlib.h&gt; #include &lt;sys/mman.h&gt; #include &lt;sys/types.h&gt; #include &lt;sys/stat.h&gt; #include &lt;fcntl.h&gt; #include &lt;unistd.h&gt; #include &lt;string&gt; #include &lt;set&gt;  int main(int argc, char* argv[]) { 	// error handling code omitted 	const char* filename = (argc &gt; 1) ? argv[1] : &quot;reconstructed.elf&quot;; 	unsigned long offset = (argc &gt; 1) ? strtol(argv[2], NULL, 16) : 0x22a0;  	int fd = open(filename, O_RDONLY); 	struct stat stbuf; 	fstat(fd, &amp;stbuf); 	const char* addr = (char*)mmap(NULL, stbuf.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0); 	close(fd); 	const char* base = addr + offset;  	typedef int (*entry_t)(char* outbuf, int id); 	entry_t entry = (entry_t)base; 	std::set&lt;std::string&gt; found; 	char buffer[1024]; 	 	for(long bits = 1; bits &lt; 64; ++ bits) { 		bool any_new = false; 		for(long id = (bits == 1) ? 0 : (1 &lt;&lt; (bits - 1)); id &lt; (1&lt;&lt;bits); ++ id) { 			int status = entry(buffer, id); 			if(status == 0) 				continue; 			if(found.find(buffer) != found.end()) 				continue; 			found.insert(buffer); 			printf(&quot;Got &#39;%s&#39;! [0x%x]\n&quot;, buffer, id); 			any_new = true; 		} 		if(!any_new) 			break; 	}  	return 0; }   This first binary had the following strings (I am keeping 3 to myself as they have client related info):  &#39;/proc/self/mem&#39;,  &#39;/proc/self/maps&#39;, &#39;/proc/self/cwd&#39;, &#39;/proc/self/environ&#39;, &#39;/proc/self/fd/%d&#39;, &#39;/proc/self/fdinfo/%d&#39;, &#39;/proc/self/limits&#39;, &#39;/proc/self/cgroup&#39;, &#39;/proc/self/exe&#39;, &#39;/proc/self/cmdline&#39;, &#39;/proc/self/mounts&#39;, &#39;/proc/self/smaps&#39;, &#39;/proc/self/stat&#39;, &#39;/proc/%d/mem&#39;,  &#39;/proc/%d/maps&#39;, &#39;/proc/%d/cwd&#39;, &#39;/proc/%d/environ&#39;, &#39;/proc/%d/fd/%d&#39;, &#39;/proc/%d/fdinfo/%d&#39;, &#39;/proc/%d/limits&#39;, &#39;/proc/%d/cgroup&#39;, &#39;/proc/%d/exe&#39;, &#39;/proc/%d/cmdline&#39;, &#39;/proc/%d/mounts&#39;, &#39;/proc/%d/smaps&#39;, &#39;/proc/%d/stat&#39;,         &#39;nfs&#39;, &#39;nfs4&#39;, &#39;tmpfs&#39;, &#39;devtmpfs&#39;, &#39;procfs&#39;, &#39;sysfs&#39;, &#39;WSL2&#39;, &#39;/etc/os-release&#39;, &#39;/etc/passwd&#39;, &#39;/etc/lsb-release&#39;, &#39;/etc/debian_version&#39;, &#39;/etc/redhat-release&#39;, &#39;/home/%s/.ssh&#39;, &#39;/var/log/wtmp&#39;, &#39;/var/log/syslog&#39;, &#39;/var/log/auth.log&#39;, &#39;/var/log/cron.log&#39;, &#39;/var/log/syslog.log&#39;, &#39;/etc/netplan/*.yaml&#39;, &#39;/etc/yp.conf&#39;, &#39;/var/yp/binding/&#39;, &#39;/etc/krb5.conf&#39;, &#39;/var/kerberos/krb5kdc/kdc.conf&#39;, &#39;/var/log/ganesha.log&#39;, &#39;/etc/ganesha/ganesha.conf&#39;, &#39;/etc/ganesha/exports&#39;, &#39;/etc/exports&#39;, &#39;Error: init failed&#39;, &#39;DELL&#39;, &#39;/usr/lib/x86_64-linux-gnu/libnfs.so.4&#39;, &#39;/tmp/.Test-unix/.fa76c5adb8c04239ff3034106842773b&#39;, &#39;Error: config missing&#39;, &#39;Error: sysdep missing&#39;, &#39;Running&#39;, &#39;LOG&#39;, &#39;/usr/lib/x86_64-linux-gnu/ganesha/libfsalvfs.so&#39;, &#39;none&#39;, &#39;/etc/sudoers&#39;, &#39;/proc/net/tcp&#39;, &#39;/proc/net/udp&#39;, &#39;/etc/selinux/config&#39;, &#39;libdl.so.2&#39;, &#39;libc-&#39;, &#39;.so&#39;, &#39;cluster-config&#39;, &#39;recovery-signal&#39;,   Eureka Moment Staring endlessly at this weird function I thought to myself: maybe I can look for code that is structured like this in all the dumps we obtained. We have all those block of mov byte ptr [rdi+?], &#39;?&#39;:    So lets look for blocks of code that are highly dense with these opcodes:  import sys  with open(sys.argv[1], &#39;rb&#39;) as f:     data = f.read()  STATE=None for i in range(len(data) - 6):     if ord(data[i]) == 0xc6 and ord(data[i + 1]) == 0x47:         if STATE and (STATE[0] + STATE[1] + 0x40) &gt;= i:             STATE[1] = i - STATE[0]             STATE[2] += 1         else:             if STATE and STATE[2] &gt;= 20:                 print(&#39;Found region at 0x%x - 0x%x&#39; % (STATE[0], STATE[0] + STATE[1]))             STATE = [i, 4, 1]    And I found them. Oh I did. Some adjustment even led to a version for ARM systems:    The GOlang thingy  I finally found the payload that was sent over to the GW machines. It had 2 stages: the first was the 8192 buffer loaded through the first covert channel. The kernel was modified to inject this buffer into the GOlang application and hook it. This will get fairly technical, but I enjoyed it and so will you:     First note that in the Golang stdlib an HTTP connection can be read through the net/http.(connReader).Read function. The calls are made through a io.Reader interface, so the calls are made through a virtual table, and the call locations cannot be statically identified.   the kernel inject begins by allocating a bunch of RWX memory immediately after the GOlang binary - let&#39;s call it the trampoline area, and it will include two types of generated trampoline functions,   Next the ELF symbol table was used to find the &#39;net/http.(*connReader).Read&#39; symbol,   What we’ll call the 1st trampoline function (code below) is copied to the trampoline area, patching the area marked with HERE with the first 9 bytes of net/http.(\*connReader).Read   mprotect(net_http_connReader_read &amp; ~0xfff, 8192, PROT_EXEC | PROT_READ | PROT_WRITE)   modified the beginning of net/http.(\*connReader).Read to a near jump into the trampoline - using 5 bytes of the 9 original used by &#39;move rcx, fs:….&#39; that are the preamble to function.   First trampoline function      pop     rax                  pop     rcx      push    rcx      push    rax      mov     r11, cs:qword_&lt;relocated&gt;      mov     rdi, rcx      call    qword ptr [r11+8]      pop     rax      pop     rcx      push    rcx      mov     rcx, fs:0FFFFFFFFFFFFFFF8h &lt;---- HERE      cmp     rsp, [rcx+10h]      jmp     rax      When the trampoline is called (from the new near jump in the beginning of net/http.(*connReader).Read) it examines the stack to locate the return address, and checks if a second type of trampoline we&#39;ll refer to as the return trampoline has already been allocated for the return address for the function,   If not it allocates a new trampoline per call location of net/http.(*connReader).Read from the code below, replacing 123456789ABCDEFh with the absolute address of a function in the malware,   GOlang uses memory for all function argument passing, so immediately after the virtual function call to Read() there will always be a 5 byte mov     reg, [rsp+?] to load Read()&#39;s result into a register. This mov instruction is copied into the first db 5 dup(0) area,   those same 5 bytes are then replacing with a near jump to the 2nd trampoline   the 2nd db 5 dup(0) are filled with a relative near jmp back to the original code patch site.         mov     rax, 123456789ABCDEFh     mov     rdi, rsp     call    rax     db 5 dup(0)     db 5 dup(0)                 This way eventually all the net/http.(*connReader).Read call sites are patched to call a function immediatly after net/http.(*connReader).Read virtual call returns. This lets the malicous code inspect the decoded HTTP packet.  On initialization the 1st stage malware also loads the hefty 2nd stage through the 2nd covert channel, and passes each buffer received from the patch on net/http.(*connReader).Read to it for inspection. The data collected is collected and compressed by the malware and stored back to the NFS server (the 2nd covert channel which bypasses read ACLs on NFS).  Before this case I did not think there was any nice way to hook random GO binaries, this technique is pretty cool.  Unfortunatly I cannot discuss what the 2nd payload actually as it will reveal stuff my employer isn&#39;t ready for yet.  How the kernel got patched? and why not the golang app? The golang app is built inside the CI/CD network segment. This segment can only be accessed through monitored jump hosts with MFA. Each day, the CI/CD pipline clones the source code from the GIT server, builds it, and automatically tests it in a pre-production segment. Once tested it gets digitally signed and uploaded to the NFS server. The running app self updates, checking the digital signature beforehand.  The kernel, on the other hand, is manually built by the guy responsible for it on his own laptop. He then digitally signs it and stores it on a server where it is used by the CI/CD pipeline. Fortunatly for us a commented out line in a script in the CI/CD pipline (a line that was not commented out in the GIT!) did not delete old versions of the kernel and we know which versions were tampered with.  We noticed a 3 month gap about 5 month ago, and it corresponded with the guy moving the kernel build from a Linux laptop to a new Windows laptop with a VirtualBox VM in it for compiling the kernel. It looks as if it took the attackers three months to gain access back into the box and into the VM build.  What we have so far  We found a bunch of malware sitting in the network collecting PII information from incoming HTTPS connection after they are decoded in a GOlang app. The data is exfiltrated through the malware network and eventually is sent to the bad guys. We have more info but I am still working on it, expect another blog post in the future with more details, samples, etc’.  Q&amp;A          Q: What was the initial access vector?      A: We have a pretty good idea, but I cannot publish it yet (RD and stuff). Stay tuned!           Q: Why didn&#39;t you upload anything to VT yet?      A: A few reasons:            I need to make sure no client info is in the binaries - some of the binaries have hardcoded strings that cannot be shared       All of the binaries I have have been reconstructed from memory dumps, so are not in their original form. Does anyone know how to upload partial dumps into VT?                Q: It there a security vulnerability in GO? in the Kernel?      A: Defenitly not! this is just an obnoxious attacker doing what obnoxious attacker do. I might even say the complexity of the stuff means they don’t have a 0day for this platform.           Q: What about YARA rules, C2 address, etc&#39;?      A: Wait for it, there is a lot more coming!           Q: Why did you publish instead of collecting more?      A: To quote the client &quot;I don&#39;t care who else they are attacking. I just want them off my lawn!&quot;, and he thinks publishing will prevent them from returning to THIS network.     Hopefully what we publish next time will get them off other people’s lawns.           Q: Any Windows malware?      A: Definitly, including what we believe is an EDR bypass. Still working on it.           Q: Any zero days?      A: Maybe …           Q: Who are these bad guys you keep refering to?      A: No clue. Didn’t find anything similiar published. There is now sure way to make anything except unsubstantiated guesses, and I won’t do that.      To be continued.">
+
+
+
+
+
+
+
+  <meta property="article:published_time" content="2021-03-24T00:00:00-04:00">
+
+
+
+
+
+
+<link rel="canonical" href="https://igor-blue.github.io/2021/03/24/apt1.html">
+
+
+
+
+<script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    
+      "@type": "Person",
+      "name": null,
+      "url": "https://igor-blue.github.io/"
+    
+  }
+</script>
+
+
+
+
+
+
+<meta name="google-site-verification" content="ys2MkDE9LQCwwqJJQLVfZlzjuLgQE2ZT4MSHOT3eHqc" />
+
+<!-- Global site tag (gtag.js) - Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-C1DLNJ2RY9"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-C1DLNJ2RY9');
+</script>
+
+<!-- end _includes/seo.html -->
+
+
+
+  <link href="/feed.xml" type="application/atom+xml" rel="alternate" title="Igor's Blog Feed">
+
+
+<!-- https://t.co/dKP3o1e -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<script>
+  document.documentElement.className = document.documentElement.className.replace(/\bno-js\b/g, '') + ' js ';
+</script>
+
+<!-- For all browsers -->
+<link rel="stylesheet" href="/assets/css/main.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@5/css/all.min.css">
+
+<!--[if IE]>
+  <style>
+    /* old IE unsupported flexbox fixes */
+    .greedy-nav .site-title {
+      padding-right: 3em;
+    }
+    .greedy-nav button {
+      position: absolute;
+      top: 0;
+      right: 0;
+      height: 100%;
+    }
+  </style>
+<![endif]-->
+
+
+    <!-- start custom head snippets -->
+
+<!-- insert favicons. use https://realfavicongenerator.net/ -->
+
+<!-- end custom head snippets -->
+
+  </head>
+
+  <body class="layout--single">
+    <nav class="skip-links">
+  <h2 class="screen-reader-text">Skip links</h2>
+  <ul>
+    <li><a href="#site-nav" class="screen-reader-shortcut">Skip to primary navigation</a></li>
+    <li><a href="#main" class="screen-reader-shortcut">Skip to content</a></li>
+    <li><a href="#footer" class="screen-reader-shortcut">Skip to footer</a></li>
+  </ul>
+</nav>
+
+    <!--[if lt IE 9]>
+<div class="notice--danger align-center" style="margin: 0;">You are using an <strong>outdated</strong> browser. Please <a href="https://browsehappy.com/">upgrade your browser</a> to improve your experience.</div>
+<![endif]-->
+
+    
+
+<div class="masthead">
+  <div class="masthead__inner-wrap">
+    <div class="masthead__menu">
+      <nav id="site-nav" class="greedy-nav">
+        
+        <a class="site-title" href="/">
+          Igor's Blog
+          
+        </a>
+        <ul class="visible-links"><li class="masthead__menu-item">
+              <a href="/about">About</a>
+            </li></ul>
+        
+        <button class="greedy-nav__toggle hidden" type="button">
+          <span class="visually-hidden">Toggle menu</span>
+          <div class="navicon"></div>
+        </button>
+        <ul class="hidden-links hidden"></ul>
+      </nav>
+    </div>
+  </div>
+</div>
+
+
+    <div class="initial-content">
+      
+
+
+
+<div id="main" role="main">
+  
+
+
+  <article class="page" itemscope itemtype="https://schema.org/CreativeWork">
+    <meta itemprop="headline" content="APT Encounters of the Third Kind">
+    <meta itemprop="description" content="A few weeks ago an ordinary security assessment turned into an incident response whirlwind. It was definitely a first for me, and I was kindly granted permission to outline the events in this blog post. This investigation started scary but turned out be quite fun, and I hope reading it will be informative to you too.  I&#39;ll be back to posting about my hardware research soon.  How it started  What hell is this?  The NFS Server  2nd malicious binary  Further forensics  Eureka Moment  The GOlang thingy  How the kernel got patched? and why not the golang app?  What we have so far  Q&amp;AHow it startedTwice a year I am hired to do security assessments for a specific client. We have been working together for several years, and I had a pretty good understanding of their network and what to look for.This time my POC, Klaus, asked me to focus on privacy issues and GDPR compliance. However, he asked me to first look at their cluster of reverse gateways / load balancers:I had some prior knowledge of these gateways, but decided to start by creating my own test environment first.The gateways run a custom Linux stack: basically a monolithic compiled kernel (without any modules), and a static GOlang application on top. The 100+ machines have no internal storage, but rather boot from an external USB media that has the kernel and the application. The GOlang app serves in two capacities: an init replacement and the reverse gateway software. During initialization it mounts /proc, /sys, devfs and so on, then mounts an NFS share hardcoded in the app. The NFS share contains the app&#39;s configuration, TLS certificates, blacklist data and a few more. It starts listening on 443, filters incoming communication and passes valid requests on different services in the production segment.I set up a self contained test environment, and spent a day in black box examination. Having found nothing much I suggested we move on to looking at the production network, but Klaus insisted I continue with the gateways. Specifically he wanted to know if I could develop a methodology for testing if an attacker has gained access to the gateways and is trying to access PII (Personally Identifiable Information) from within the decrypted HTTP stream.I couldn&#39;t SSH into the host (no SSH), so I figured we will have to add some kind of instrumentation to the GO app. Klaus still insisted I start by looking at the traffic before (red) and after the GW (green), and gave me access to a mirrored port on both sides so I could capture traffic to a standalone laptop he prepared for me and I could access through an LTE modem but was not allowed to upload data from:The problem I faced now was how to find out what HTTPS traffic corresponded to requests with embedded PII. One possible avenue was to try and correlate the encrypted traffic with the decrypted HTTP traffic. This proved impossible using timing alone. However, unspecting the decoded traffic I noticed the GW app adds an &#39;X-Orig-Connection&#39; with the four-tuple of the TLS connection! Yay!I wrote a small python program to scan the port 80 traffic capture and create a mapping from each four-tuple TLS connection to a boolean - True for connection with PII and False for all others:10.4.254.254,443,[Redacted],43404,376106847.319,False10.4.254.254,443,[Redacted],52064,376106856.146,False10.4.254.254,443,[Redacted],40946,376106856.295,False10.4.254.254,443,[Redacted],48366,376106856.593,False10.4.254.254,443,[Redacted],48362,376106856.623,True10.4.254.254,443,[Redacted],45872,376106856.645,False10.4.254.254,443,[Redacted],40124,376106856.675,False ...With this in mind I could now extract the data from the PCAPs and do some correlations. After a few long hours getting scapy to actually parse timestamps consistently enough for comparisons, I had a list of connection timing information correlated with PII. A few more fun hours with Excel and I got histogram graphs of time vs count of packets. Everything looked normal for the HTTP traffic, although I expected more of a normal distribution than the power-low type thingy I got. Port 443 initially looked the same, and I got the normal distribution I expected. But when filtering for PII something was seriously wrong. The distribution was skewed and shifted to longer time frames. And there was nothing similar on the port 80 end.My only explanation was that something was wrong with my testing setup (the blue bars) vs. the real live setup (the orange bars). I wrote on our slack channel &#39;I think my setup is sh*t, can anyone resend me the config files?&#39;, but this was already very late at night, and no one responded. Having a slight OCD I couldn’t let this go. To my rescue came another security? feature of the GWs: Thet restarted daily, staggered one by one, with about 10 minutes between hosts. This means that every ten minutes or so one of them would reboot, and thus reload it’s configuration files over NFS. And since I could see the NFS traffic through the port mirror I had access to, I recokoned I could get the production configuration files from the NFS capture (bottom dotted blue line in the diagram before).So to cut a long story short I found the NFS read reply packet, and got the data I need. But … why the hack is eof 77685??? Come on people, its 3:34AM!What&#39;s more, the actual data was 77685 bytes, exactly 8192 bytes more then the ‘Read length’. The entropy for that data was pretty uniform, suggesting it was encrypted. The file I had was definitely not encrypted.Histogram of extra 8192 bytes:When I mounted the NFS export myself I got a normal EOF value of 1!What hell is this?Comparing the capture from my testing machine with the one from the port mirror I saw something else weird:For other NFS open requests (on all of my test system captures and for other files in the production system) we get:Spot the difference?The open id: string became open-id:. Was I dealing with some corrupt packet? But the exact same problem reappeared the next time blacklist.db was send over the wire by another GW host.Time to look at the kernel source code:The “open id” string is hardcoded. What&#39;s up?After a good night sleep and no beer this time I repeated the experiment and convincing myself I was not hullucinating I decided to compare the source code of the exact kernel version with the kernel binary I got.What I expected to see was this (from nfs4xdr.c):static inline void encode_openhdr(struct xdr_stream *xdr, const struct nfs_openargs *arg){    __be32 *p; /* * opcode 4, seqid 4, share_access 4, share_deny 4, clientid 8, ownerlen 4, * owner 4 = 32 */    encode_nfs4_seqid(xdr, arg-&gt;seqid);    encode_share_access(xdr, arg-&gt;share_access);    p = reserve_space(xdr, 36);    p = xdr_encode_hyper(p, arg-&gt;clientid);    *p++ = cpu_to_be32(24);    p = xdr_encode_opaque_fixed(p, &quot;open id:&quot;, 8);    *p++ = cpu_to_be32(arg-&gt;server-&gt;s_dev);    *p++ = cpu_to_be32(arg-&gt;id.uniquifier);    xdr_encode_hyper(p, arg-&gt;id.create_time);}Running binwalk -e -M bzImage I got the internal ELF image, and opened it in IDA. Of course I didn’t have any symbols, but I got nfs4_xdr_enc_open() from /proc/kallsyms, and from there to encode_open() which led me to encode_openhdr().With some help from hex-rays I got code that looked very similiar, but with one key difference:static inline void encode_openhdr(struct xdr_stream *xdr, const struct nfs_openargs *arg){    ...    p = xdr_encode_opaque_fixed(p, unknown_func(&quot;open id:&quot;, arg), 8);    ...}The function unknown_func was pretty long and complicated but eventually sometimes decided to replace the space between &#39;open&#39; and &#39;id&#39; with a hyphen.Does the NFS server care? Apparently this string it is some opaque client identifier that is ignored by the NFS server, so no one would see the difference. That is unless they were trying to extract something from an NFS stream, and obviously this was not a likely scenario. OK, back to the weird &#39;eof&#39; thingy from the NFS server.The NFS ServerThe server was running the &#39;NFS-ganesha-3.3&#39; package. This is a very modular user-space NFS server that is implemented as a series of loadable modules called FSALs. For example support for files on the regular filesystem is implemented through a module called libfsalvfs.so.Having verified all the files on disk had the same SHA1 as the distro package, I decided to dump the process memory. I didn&#39;t have any tools on the host, so I used GDB which helpfully was already there. Unexpectadly GDB was suddenly killed, the file I specified as output got erased, and the nfs server process restarted.I took the dump again but there was nothing special there!I was pretty suspicious at this time, and wanted to recover the original dump file from the first dump. Fortunately for me I was dumping the file to the laptop, again over NFS. The file had been deleted, but I managed to recover it from the disk on that server.2nd malicious binaryThe memory dump was truncated, but had a corrupt version of NFS-ganesha inside. There were two libfsalvfs.so libraries loaded: the original one and an injected SO file with the same name. The injected file was clearly malicious. The main binary was patched in a few places, and the  function table into libfsalvfs.so as replaced with the alternate libfsalvfs.so. The alternate file was compiled from NFS-ganesha sources, but modified to include new and improved (wink wink) functionality.The most interesting of the new functionality were two separate implementations of covert channels.The first one we encountered already:  When an open request comes in with &#39;open-id&#39; instead of &#39;open id&#39;, the file handle is marked. This change is opaque to the NFS server, so unpatched servers just ignore it and nothing much happens.  For infiltrated NFS server, when the file handle opened this way is read, the NFS server appends the last block with a payload coming from the malware&#39;s runtime storage, and the &#39;eof&#39; on-the-wire value is changed to be the new total size. An unpatched kernel (which shouldn’t really happen, since it marked the file in the first place) will just ignore the extra bytes. The EOF value is used as a bool, e.g. checked for 0 or not and not a specific value, so having a large integer values doesn’t change anything in the flow of an unmodified kernel.The second covert channel is used for command and control, and is implemented in the VFS code as a fake directory.Any writes to /&lt;export&gt;/.snapshot/meta/&lt;cmdid&gt; are handled by the malware code and not passed on to the FS. They are pseudo-files that implement commands through read and write operations.The malware implemented the following commands:  1701 - self destruct  1702 - set auto self destruct time  1703 - run shell command  1704 - load SO file from buffer specified in command  1706 - get basic system description  1707 - get network connections  170A - upgrade to new SO file  74201 - put buffer in memory dict by ID  74202 - get buffer from memory dict by ID  74650 - put a payload in memory for the first covert channel  74651 - arm the first covert channel  74652 - disarm the first covert channelFor example cp payload.so /mnt/server/.snapshot/meta/1704 will load the SO file in the NFS ganesha process on the target server, and echo 1616580589 &gt; /mnt/server/.snapshot/meta/1702 will set an autodestruct time. Reading this file will retrieve the time.The self destruct command (0x1701) is very interesting - it sends a UDP broadcast on port 41701 with a random payload of size 321 bytes, and then restarts a clean NFS-ganesha. I guess this is some kind of network signalling.It appears the malware has a watchdog that iterates over all /proc/&lt;pid&gt;/fd/* links every 25ms, and if a link is open to /proc/&lt;malware pid&gt;/maps or /proc/&lt;malware pid&gt;/smaps or  /proc/&lt;malware pid&gt;/mem it:  kills the offending process,  deletes any writeable file handle it had opened (before it was killed) in /proc/&lt;pid&gt;/fd/, first trying to wipe it,  calls the self destruct command (0x1701).Further forensicsLets go back to that awful Saturday I triggered the self-destruct. Having a faint understanding I triggered something (that being before I reversed the devil) I asked Klaus to disconnect all the network connections to the outer world and we started taking memory dumps of whatever we could, storing them all on the laptop.In hindsight we destroyed quiet a bit of evidence by triggering more self destructs in other subnets, but I think the self destruct signal has already gone out to the bad guys through a different piece of malware that I later partially recovered, and probably &quot;heard&quot; the UDP distress signal (that&#39;s what is was called in the binary, not my naming).After getting all the forensics the client insisted on reconnecting his systems to the web, they were &quot;losing money&quot;. I switched from forensics to reversing.  In the process, while inspecting the malicious libfsalvfs.so I discovered the commands I mentioned above, and discovered a &quot;feature&quot; that helped me fill more paces of the puzzle.Reversing malware you always find some feeble attempt to obfuscate string using XOR or RC4, or just scrambling the letter ordering. In this case I pretty quickly found a function I called get_obfuscated_string(buffer, string_id). The difference however, was that this one was just horrendous, practically irreversible:It had like a billion nested switches:I think they let some intern fresh out of college write that one. It seems the complete list of strings used by the tool are encoded inside in a tree of nested switches, with a variable length encoding, e.g. in one branch the 2nd level might have 3 bits and in another it might have 5 and in a third only a single bit. Some kind of prefix tree if I remember anything from Uni.Eventually I managed to write code to just brute force the function:#include &lt;stdio.h&gt;#include &lt;stdlib.h&gt;#include &lt;sys/mman.h&gt;#include &lt;sys/types.h&gt;#include &lt;sys/stat.h&gt;#include &lt;fcntl.h&gt;#include &lt;unistd.h&gt;#include &lt;string&gt;#include &lt;set&gt;int main(int argc, char* argv[]){	// error handling code omitted	const char* filename = (argc &gt; 1) ? argv[1] : &quot;reconstructed.elf&quot;;	unsigned long offset = (argc &gt; 1) ? strtol(argv[2], NULL, 16) : 0x22a0;	int fd = open(filename, O_RDONLY);	struct stat stbuf;	fstat(fd, &amp;stbuf);	const char* addr = (char*)mmap(NULL, stbuf.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);	close(fd);	const char* base = addr + offset;	typedef int (*entry_t)(char* outbuf, int id);	entry_t entry = (entry_t)base;	std::set&lt;std::string&gt; found;	char buffer[1024];		for(long bits = 1; bits &lt; 64; ++ bits) {		bool any_new = false;		for(long id = (bits == 1) ? 0 : (1 &lt;&lt; (bits - 1)); id &lt; (1&lt;&lt;bits); ++ id) {			int status = entry(buffer, id);			if(status == 0)				continue;			if(found.find(buffer) != found.end())				continue;			found.insert(buffer);			printf(&quot;Got &#39;%s&#39;! [0x%x]\n&quot;, buffer, id);			any_new = true;		}		if(!any_new)			break;	}	return 0;}This first binary had the following strings (I am keeping 3 to myself as they have client related info):&#39;/proc/self/mem&#39;, &#39;/proc/self/maps&#39;,&#39;/proc/self/cwd&#39;,&#39;/proc/self/environ&#39;,&#39;/proc/self/fd/%d&#39;,&#39;/proc/self/fdinfo/%d&#39;,&#39;/proc/self/limits&#39;,&#39;/proc/self/cgroup&#39;,&#39;/proc/self/exe&#39;,&#39;/proc/self/cmdline&#39;,&#39;/proc/self/mounts&#39;,&#39;/proc/self/smaps&#39;,&#39;/proc/self/stat&#39;,&#39;/proc/%d/mem&#39;, &#39;/proc/%d/maps&#39;,&#39;/proc/%d/cwd&#39;,&#39;/proc/%d/environ&#39;,&#39;/proc/%d/fd/%d&#39;,&#39;/proc/%d/fdinfo/%d&#39;,&#39;/proc/%d/limits&#39;,&#39;/proc/%d/cgroup&#39;,&#39;/proc/%d/exe&#39;,&#39;/proc/%d/cmdline&#39;,&#39;/proc/%d/mounts&#39;,&#39;/proc/%d/smaps&#39;,&#39;/proc/%d/stat&#39;,        &#39;nfs&#39;,&#39;nfs4&#39;,&#39;tmpfs&#39;,&#39;devtmpfs&#39;,&#39;procfs&#39;,&#39;sysfs&#39;,&#39;WSL2&#39;,&#39;/etc/os-release&#39;,&#39;/etc/passwd&#39;,&#39;/etc/lsb-release&#39;,&#39;/etc/debian_version&#39;,&#39;/etc/redhat-release&#39;,&#39;/home/%s/.ssh&#39;,&#39;/var/log/wtmp&#39;,&#39;/var/log/syslog&#39;,&#39;/var/log/auth.log&#39;,&#39;/var/log/cron.log&#39;,&#39;/var/log/syslog.log&#39;,&#39;/etc/netplan/*.yaml&#39;,&#39;/etc/yp.conf&#39;,&#39;/var/yp/binding/&#39;,&#39;/etc/krb5.conf&#39;,&#39;/var/kerberos/krb5kdc/kdc.conf&#39;,&#39;/var/log/ganesha.log&#39;,&#39;/etc/ganesha/ganesha.conf&#39;,&#39;/etc/ganesha/exports&#39;,&#39;/etc/exports&#39;,&#39;Error: init failed&#39;,&#39;DELL&#39;,&#39;/usr/lib/x86_64-linux-gnu/libnfs.so.4&#39;,&#39;/tmp/.Test-unix/.fa76c5adb8c04239ff3034106842773b&#39;,&#39;Error: config missing&#39;,&#39;Error: sysdep missing&#39;,&#39;Running&#39;,&#39;LOG&#39;,&#39;/usr/lib/x86_64-linux-gnu/ganesha/libfsalvfs.so&#39;,&#39;none&#39;,&#39;/etc/sudoers&#39;,&#39;/proc/net/tcp&#39;,&#39;/proc/net/udp&#39;,&#39;/etc/selinux/config&#39;,&#39;libdl.so.2&#39;,&#39;libc-&#39;,&#39;.so&#39;,&#39;cluster-config&#39;,&#39;recovery-signal&#39;,Eureka MomentStaring endlessly at this weird function I thought to myself: maybe I can look for code that is structured like this in all the dumps we obtained. We have all those block of mov byte ptr [rdi+?], &#39;?&#39;:So lets look for blocks of code that are highly dense with these opcodes:import syswith open(sys.argv[1], &#39;rb&#39;) as f:    data = f.read()STATE=Nonefor i in range(len(data) - 6):    if ord(data[i]) == 0xc6 and ord(data[i + 1]) == 0x47:        if STATE and (STATE[0] + STATE[1] + 0x40) &gt;= i:            STATE[1] = i - STATE[0]            STATE[2] += 1        else:            if STATE and STATE[2] &gt;= 20:                print(&#39;Found region at 0x%x - 0x%x&#39; % (STATE[0], STATE[0] + STATE[1]))            STATE = [i, 4, 1] And I found them. Oh I did. Some adjustment even led to a version for ARM systems:The GOlang thingyI finally found the payload that was sent over to the GW machines. It had 2 stages: the first was the 8192 buffer loaded through the first covert channel. The kernel was modified to inject this buffer into the GOlang application and hook it. This will get fairly technical, but I enjoyed it and so will you:  First note that in the Golang stdlib an HTTP connection can be read through the net/http.(connReader).Read function. The calls are made through a io.Reader interface, so the calls are made through a virtual table, and the call locations cannot be statically identified.  the kernel inject begins by allocating a bunch of RWX memory immediately after the GOlang binary - let&#39;s call it the trampoline area, and it will include two types of generated trampoline functions,  Next the ELF symbol table was used to find the &#39;net/http.(*connReader).Read&#39; symbol,  What we’ll call the 1st trampoline function (code below) is copied to the trampoline area, patching the area marked with HERE with the first 9 bytes of net/http.(\*connReader).Read  mprotect(net_http_connReader_read &amp; ~0xfff, 8192, PROT_EXEC | PROT_READ | PROT_WRITE)  modified the beginning of net/http.(\*connReader).Read to a near jump into the trampoline - using 5 bytes of the 9 original used by &#39;move rcx, fs:….&#39; that are the preamble to function.First trampoline function     pop     rax                 pop     rcx     push    rcx     push    rax     mov     r11, cs:qword_&lt;relocated&gt;     mov     rdi, rcx     call    qword ptr [r11+8]     pop     rax     pop     rcx     push    rcx     mov     rcx, fs:0FFFFFFFFFFFFFFF8h &lt;---- HERE     cmp     rsp, [rcx+10h]     jmp     rax  When the trampoline is called (from the new near jump in the beginning of net/http.(*connReader).Read) it examines the stack to locate the return address, and checks if a second type of trampoline we&#39;ll refer to as the return trampoline has already been allocated for the return address for the function,  If not it allocates a new trampoline per call location of net/http.(*connReader).Read from the code below, replacing 123456789ABCDEFh with the absolute address of a function in the malware,  GOlang uses memory for all function argument passing, so immediately after the virtual function call to Read() there will always be a 5 byte mov     reg, [rsp+?] to load Read()&#39;s result into a register. This mov instruction is copied into the first db 5 dup(0) area,  those same 5 bytes are then replacing with a near jump to the 2nd trampoline  the 2nd db 5 dup(0) are filled with a relative near jmp back to the original code patch site.        mov     rax, 123456789ABCDEFh    mov     rdi, rsp    call    rax    db 5 dup(0)    db 5 dup(0)            This way eventually all the net/http.(*connReader).Read call sites are patched to call a function immediatly after net/http.(*connReader).Read virtual call returns. This lets the malicous code inspect the decoded HTTP packet.On initialization the 1st stage malware also loads the hefty 2nd stage through the 2nd covert channel, and passes each buffer received from the patch on net/http.(*connReader).Read to it for inspection.The data collected is collected and compressed by the malware and stored back to the NFS server (the 2nd covert channel which bypasses read ACLs on NFS).Before this case I did not think there was any nice way to hook random GO binaries, this technique is pretty cool.Unfortunatly I cannot discuss what the 2nd payload actually as it will reveal stuff my employer isn&#39;t ready for yet.How the kernel got patched? and why not the golang app?The golang app is built inside the CI/CD network segment. This segment can only be accessed through monitored jump hosts with MFA. Each day, the CI/CD pipline clones the source code from the GIT server, builds it, and automatically tests it in a pre-production segment. Once tested it gets digitally signed and uploaded to the NFS server. The running app self updates, checking the digital signature beforehand.The kernel, on the other hand, is manually built by the guy responsible for it on his own laptop. He then digitally signs it and stores it on a server where it is used by the CI/CD pipeline. Fortunatly for us a commented out line in a script in the CI/CD pipline (a line that was not commented out in the GIT!) did not delete old versions of the kernel and we know which versions were tampered with.We noticed a 3 month gap about 5 month ago, and it corresponded with the guy moving the kernel build from a Linux laptop to a new Windows laptop with a VirtualBox VM in it for compiling the kernel. It looks as if it took the attackers three months to gain access back into the box and into the VM build.What we have so farWe found a bunch of malware sitting in the network collecting PII information from incoming HTTPS connection after they are decoded in a GOlang app. The data is exfiltrated through the malware network and eventually is sent to the bad guys.We have more info but I am still working on it, expect another blog post in the future with more details, samples, etc’.Q&amp;A      Q: What was the initial access vector?    A: We have a pretty good idea, but I cannot publish it yet (RD and stuff). Stay tuned!        Q: Why didn&#39;t you upload anything to VT yet?    A: A few reasons:          I need to make sure no client info is in the binaries - some of the binaries have hardcoded strings that cannot be shared      All of the binaries I have have been reconstructed from memory dumps, so are not in their original form. Does anyone know how to upload partial dumps into VT?            Q: It there a security vulnerability in GO? in the Kernel?    A: Defenitly not! this is just an obnoxious attacker doing what obnoxious attacker do. I might even say the complexity of the stuff means they don’t have a 0day for this platform.        Q: What about YARA rules, C2 address, etc&#39;?    A: Wait for it, there is a lot more coming!        Q: Why did you publish instead of collecting more?    A: To quote the client &quot;I don&#39;t care who else they are attacking. I just want them off my lawn!&quot;, and he thinks publishing will prevent them from returning to THIS network.    Hopefully what we publish next time will get them off other people’s lawns.        Q: Any Windows malware?    A: Definitly, including what we believe is an EDR bypass. Still working on it.        Q: Any zero days?    A: Maybe …        Q: Who are these bad guys you keep refering to?    A: No clue. Didn’t find anything similiar published. There is now sure way to make anything except unsubstantiated guesses, and I won’t do that.  To be continued.">
+    <meta itemprop="datePublished" content="2021-03-24T00:00:00-04:00">
+    
+
+    <div class="page__inner-wrap">
+      
+        <header>
+          <h1 id="page-title" class="page__title" itemprop="headline">APT Encounters of the Third Kind
+</h1>
+          
+
+  <p class="page__meta">
+    
+
+    
+
+    
+      
+      
+
+      <span class="page__meta-readtime">
+        <i class="far fa-clock" aria-hidden="true"></i>
+        
+          18 minute read
+        
+      </span>
+    
+  </p>
+
+
+        </header>
+      
+
+      <section class="page__content" itemprop="text">
+        
+        <p>A few weeks ago an ordinary security assessment turned into an incident response whirlwind. It was definitely a first for me, and I was kindly granted permission to outline the events in this blog post. This investigation started scary but turned out be quite fun, and I hope reading it will be informative to you too.  I'll be back to posting about my hardware research soon.</p>
+
+<ul id="markdown-toc">
+  <li><a href="#how-it-started" id="markdown-toc-how-it-started">How it started</a></li>
+  <li><a href="#what-hell-is-this" id="markdown-toc-what-hell-is-this">What hell is this?</a></li>
+  <li><a href="#the-nfs-server" id="markdown-toc-the-nfs-server">The NFS Server</a></li>
+  <li><a href="#2nd-malicious-binary" id="markdown-toc-2nd-malicious-binary">2nd malicious binary</a></li>
+  <li><a href="#further-forensics" id="markdown-toc-further-forensics">Further forensics</a></li>
+  <li><a href="#eureka-moment" id="markdown-toc-eureka-moment">Eureka Moment</a></li>
+  <li><a href="#the-golang-thingy" id="markdown-toc-the-golang-thingy">The GOlang thingy</a></li>
+  <li><a href="#how-the-kernel-got-patched-and-why-not-the-golang-app" id="markdown-toc-how-the-kernel-got-patched-and-why-not-the-golang-app">How the kernel got patched? and why not the golang app?</a></li>
+  <li><a href="#what-we-have-so-far" id="markdown-toc-what-we-have-so-far">What we have so far</a></li>
+  <li><a href="#qa" id="markdown-toc-qa">Q&amp;A</a></li>
+</ul>
+
+<h1 id="how-it-started">How it started</h1>
+<p>Twice a year I am hired to do security assessments for a specific client. We have been working together for several years, and I had a pretty good understanding of their network and what to look for.</p>
+
+<p>This time my POC, Klaus, asked me to focus on privacy issues and GDPR compliance. However, he asked me to first look at their cluster of reverse gateways / load balancers:</p>
+
+<p><img src="/images/im10_network.png" alt="LB Architecture" /></p>
+
+<p>I had some prior knowledge of these gateways, but decided to start by creating my own test environment first.
+The gateways run a custom Linux stack: basically a monolithic compiled kernel (without any modules), and a static GOlang application on top. The 100+ machines have no internal storage, but rather boot from an external USB media that has the kernel and the application. The GOlang app serves in two capacities: an <code class="language-plaintext highlighter-rouge">init</code> replacement and the reverse gateway software. During initialization it mounts /proc, /sys, devfs and so on, then mounts an NFS share hardcoded in the app. The NFS share contains the app's configuration, TLS certificates, blacklist data and a few more. It starts listening on 443, filters incoming communication and passes valid requests on different services in the production segment.</p>
+
+<p><img src="/images/im12_gwstack.png" alt="GW Architecture" /></p>
+
+<p>I set up a self contained test environment, and spent a day in black box examination. Having found nothing much I suggested we move on to looking at the production network, but Klaus insisted I continue with the gateways. Specifically he wanted to know if I could develop a methodology for testing if an attacker has gained access to the gateways and is trying to access PII (Personally Identifiable Information) from within the decrypted HTTP stream.</p>
+
+<p>I couldn't SSH into the host (no SSH), so I figured we will have to add some kind of instrumentation to the GO app. Klaus still insisted I start by looking at the traffic before (red) and after the GW (green), and gave me access to a mirrored port on both sides so I could capture traffic to a standalone laptop he prepared for me and I could access through an LTE modem but was not allowed to upload data from:</p>
+
+<p><img src="/images/im13_gwstack_colors2.png" alt="GW Architecture" /></p>
+
+<p>The problem I faced now was how to find out what HTTPS traffic corresponded to requests with embedded PII. One possible avenue was to try and correlate the encrypted traffic with the decrypted HTTP traffic. This proved impossible using timing alone. However, unspecting the decoded traffic I noticed the GW app adds an 'X-Orig-Connection' with the four-tuple of the TLS connection! Yay!</p>
+
+<p><img src="/images/im20_sniff80.png" alt="Original connection" /></p>
+
+<p>I wrote a small python program to scan the port 80 traffic capture and create a mapping from each four-tuple TLS connection to a boolean - True for connection with PII and False for all others:</p>
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>10.4.254.254,443,[Redacted],43404,376106847.319,False
+10.4.254.254,443,[Redacted],52064,376106856.146,False
+10.4.254.254,443,[Redacted],40946,376106856.295,False
+10.4.254.254,443,[Redacted],48366,376106856.593,False
+10.4.254.254,443,[Redacted],48362,376106856.623,True
+10.4.254.254,443,[Redacted],45872,376106856.645,False
+10.4.254.254,443,[Redacted],40124,376106856.675,False 
+...
+</code></pre></div></div>
+
+<p>With this in mind I could now extract the data from the PCAPs and do some correlations. After a few long hours getting <code class="language-plaintext highlighter-rouge">scapy</code> to actually parse timestamps consistently enough for comparisons, I had a list of connection timing information correlated with PII. A few more fun hours with Excel and I got histogram graphs of time vs count of packets. Everything looked normal for the HTTP traffic, although I expected more of a normal distribution than the power-low type thingy I got. Port 443 initially looked the same, and I got the normal distribution I expected. But when filtering for PII something was <em>seriously</em> wrong. The distribution was skewed and shifted to longer time frames. And there was nothing similar on the port 80 end.</p>
+
+<p><img src="/images/im23_graphs1.png" alt="Histograms" /></p>
+
+<p>My only explanation was that something was wrong with my testing setup (the blue bars) vs. the real live setup (the orange bars). I wrote on our slack channel 'I think my setup is sh*t, can anyone resend me the config files?', but this was already very late at night, and no one responded. Having a slight OCD I couldn’t let this go. To my rescue came another security? feature of the GWs: Thet restarted daily, staggered one by one, with about 10 minutes between hosts. This means that every ten minutes or so one of them would reboot, and thus reload it’s configuration files over NFS. And since I could see the NFS traffic through the port mirror I had access to, I recokoned I could get the production configuration files from the NFS capture (bottom dotted blue line in the diagram before).</p>
+
+<p>So to cut a long story short I found the NFS read reply packet, and got the <strong>data</strong> I need. But … why the hack is <code class="language-plaintext highlighter-rouge">eof</code> 77685??? Come on people, its 3:34AM!</p>
+
+<p>What's more, the actual data was 77685 bytes, exactly 8192 bytes more then the ‘Read length’. The entropy for that data was pretty uniform, suggesting it was encrypted. The file I had was definitely not encrypted.</p>
+
+<p><img src="/images/im30_nfs_cap1.png" alt="First NFS capture" /></p>
+
+<p>Histogram of extra 8192 bytes:</p>
+
+<p><img src="/images/im31_histogram.png" alt="NFS capture hist" /></p>
+
+<p>When I mounted the NFS export myself I got a normal EOF value of <code class="language-plaintext highlighter-rouge">1</code>!</p>
+
+<p><img src="/images/img33_normal_eof.png" alt="NFS capture hist" /></p>
+
+<h1 id="what-hell-is-this">What hell is this?</h1>
+
+<p>Comparing the capture from my testing machine with the one from the port mirror I saw something else weird:</p>
+
+<p><img src="/images/im41_nfs1.png" alt="NFS capture hist" /></p>
+
+<p>For other NFS open requests (on all of my test system captures and for other files in the production system) we get:</p>
+
+<p><img src="/images/im42_nfs2.png" alt="NFS capture hist" /></p>
+
+<p>Spot the difference?</p>
+
+<p>The <code class="language-plaintext highlighter-rouge">open id:</code> string became <code class="language-plaintext highlighter-rouge">open-id:</code>. Was I dealing with some corrupt packet? But the exact same problem reappeared the next time <code class="language-plaintext highlighter-rouge">blacklist.db</code> was send over the wire by another GW host.</p>
+
+<p>Time to look at the kernel source code:</p>
+
+<p><img src="/images/im50_grep.png" alt="NFS capture hist" /></p>
+
+<p>The “open id” string is hardcoded. What's up?</p>
+
+<p>After a good night sleep and no beer this time I repeated the experiment and convincing myself I was not hullucinating I decided to compare the source code of the exact kernel version with the kernel binary I got.</p>
+
+<p>What I expected to see was this (from nfs4xdr.c):</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">encode_openhdr</span><span class="p">(</span><span class="k">struct</span> <span class="n">xdr_stream</span> <span class="o">*</span><span class="n">xdr</span><span class="p">,</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">nfs_openargs</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">__be32</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+ <span class="cm">/*
+ * opcode 4, seqid 4, share_access 4, share_deny 4, clientid 8, ownerlen 4,
+ * owner 4 = 32
+ */</span>
+    <span class="n">encode_nfs4_seqid</span><span class="p">(</span><span class="n">xdr</span><span class="p">,</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">seqid</span><span class="p">);</span>
+    <span class="n">encode_share_access</span><span class="p">(</span><span class="n">xdr</span><span class="p">,</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">share_access</span><span class="p">);</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="n">reserve_space</span><span class="p">(</span><span class="n">xdr</span><span class="p">,</span> <span class="mi">36</span><span class="p">);</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="n">xdr_encode_hyper</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">clientid</span><span class="p">);</span>
+    <span class="o">*</span><span class="n">p</span><span class="o">++</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="mi">24</span><span class="p">);</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="n">xdr_encode_opaque_fixed</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">"open id:"</span><span class="p">,</span> <span class="mi">8</span><span class="p">);</span>
+    <span class="o">*</span><span class="n">p</span><span class="o">++</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="n">arg</span><span class="o">-&gt;</span><span class="n">server</span><span class="o">-&gt;</span><span class="n">s_dev</span><span class="p">);</span>
+    <span class="o">*</span><span class="n">p</span><span class="o">++</span> <span class="o">=</span> <span class="n">cpu_to_be32</span><span class="p">(</span><span class="n">arg</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">.</span><span class="n">uniquifier</span><span class="p">);</span>
+    <span class="n">xdr_encode_hyper</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">arg</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">.</span><span class="n">create_time</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div></div>
+
+<p>Running <code class="language-plaintext highlighter-rouge">binwalk -e -M bzImage</code> I got the internal ELF image, and opened it in IDA. Of course I didn’t have any symbols, but I got <code class="language-plaintext highlighter-rouge">nfs4_xdr_enc_open()</code> from /proc/kallsyms, and from there to <code class="language-plaintext highlighter-rouge">encode_open()</code> which led me to <code class="language-plaintext highlighter-rouge">encode_openhdr()</code>.
+With some help from hex-rays I got code that looked very similiar, but with one key difference:</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">static</span> <span class="kr">inline</span> <span class="kt">void</span> <span class="nf">encode_openhdr</span><span class="p">(</span><span class="k">struct</span> <span class="n">xdr_stream</span> <span class="o">*</span><span class="n">xdr</span><span class="p">,</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">nfs_openargs</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="p">...</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="n">xdr_encode_opaque_fixed</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">unknown_func</span><span class="p">(</span><span class="s">"open id:"</span><span class="p">,</span> <span class="n">arg</span><span class="p">),</span> <span class="mi">8</span><span class="p">);</span>
+    <span class="p">...</span>
+<span class="p">}</span>
+</code></pre></div></div>
+
+<p>The function <code class="language-plaintext highlighter-rouge">unknown_func</code> was pretty long and complicated but eventually sometimes decided to replace the space between 'open' and 'id' with a hyphen.</p>
+
+<p>Does the NFS server care? Apparently this string it is some opaque client identifier that is ignored by the NFS server, so no one would see the difference. That is unless they were trying to extract something from an NFS stream, and obviously this was not a likely scenario. OK, back to the weird 'eof' thingy from the NFS server.</p>
+
+<h1 id="the-nfs-server">The NFS Server</h1>
+
+<p>The server was running the 'NFS-ganesha-3.3' package. This is a very modular user-space NFS server that is implemented as a series of loadable modules called FSALs. For example support for files on the regular filesystem is implemented through a module called <code class="language-plaintext highlighter-rouge">libfsalvfs.so</code>.
+Having verified all the files on disk had the same SHA1 as the distro package, I decided to dump the process memory. I didn't have any tools on the host, so I used GDB which helpfully was already there. Unexpectadly GDB was suddenly killed, the file I specified as output got erased, and the nfs server process restarted.</p>
+
+<p>I took the dump again but there was nothing special there!</p>
+
+<p>I was pretty suspicious at this time, and wanted to recover the original dump file from the first dump. Fortunately for me I was dumping the file to the laptop, again over NFS. The file had been deleted, but I managed to recover it from the disk on that server.</p>
+
+<h1 id="2nd-malicious-binary">2nd malicious binary</h1>
+
+<p>The memory dump was truncated, but had a <strong>corrupt</strong> version of NFS-ganesha inside. There were two <code class="language-plaintext highlighter-rouge">libfsalvfs.so</code> libraries loaded: the original one and an injected SO file with the same name. The injected file was clearly malicious. The main binary was patched in a few places, and the  function table into <code class="language-plaintext highlighter-rouge">libfsalvfs.so</code> as replaced with the alternate <code class="language-plaintext highlighter-rouge">libfsalvfs.so</code>. The alternate file was compiled from NFS-ganesha sources, but modified to include <em>new and improved</em> (wink wink) functionality.</p>
+
+<p>The most interesting of the new functionality were two separate implementations of covert channels.</p>
+
+<p>The first one we encountered already:</p>
+
+<ul>
+  <li>When an open request comes in with 'open-id' instead of 'open id', the file handle is marked. This change is opaque to the NFS server, so unpatched servers just ignore it and nothing much happens.</li>
+  <li>For infiltrated NFS server, when the file handle opened this way is read, the NFS server appends the last block with a payload coming from the malware's runtime storage, and the 'eof' on-the-wire value is changed to be the new total size. An unpatched kernel (which shouldn’t really happen, since it marked the file in the first place) will just ignore the extra bytes. The EOF value is used as a bool, e.g. checked for 0 or not and not a specific value, so having a large integer values doesn’t change anything in the flow of an unmodified kernel.</li>
+</ul>
+
+<p>The second covert channel is used for command and control, and is implemented in the VFS code as a fake directory.</p>
+
+<p>Any writes to <code class="language-plaintext highlighter-rouge">/&lt;export&gt;/.snapshot/meta/&lt;cmdid&gt;</code> are handled by the malware code and not passed on to the FS. They are pseudo-files that implement commands through read and write operations.</p>
+
+<p>The malware implemented the following commands:</p>
+<ul>
+  <li>1701 - self destruct</li>
+  <li>1702 - set auto self destruct time</li>
+  <li>1703 - run shell command</li>
+  <li>1704 - load SO file from buffer specified in command</li>
+  <li>1706 - get basic system description</li>
+  <li>1707 - get network connections</li>
+  <li>170A - upgrade to new SO file</li>
+  <li>74201 - put buffer in memory dict by ID</li>
+  <li>74202 - get buffer from memory dict by ID</li>
+  <li>74650 - put a payload in memory for the first covert channel</li>
+  <li>74651 - arm the first covert channel</li>
+  <li>74652 - disarm the first covert channel</li>
+</ul>
+
+<p>For example <code class="language-plaintext highlighter-rouge">cp payload.so /mnt/server/.snapshot/meta/1704</code> will load the SO file in the NFS ganesha process on the target server, and <code class="language-plaintext highlighter-rouge">echo 1616580589 &gt; /mnt/server/.snapshot/meta/1702</code> will set an autodestruct time. Reading this file will retrieve the time.</p>
+
+<p>The self destruct command (0x1701) is very interesting - it sends a UDP broadcast on port 41701 with a random payload of size 321 bytes, and then restarts a clean NFS-ganesha. I guess this is some kind of network signalling.</p>
+
+<p>It appears the malware has a watchdog that iterates over all <code class="language-plaintext highlighter-rouge">/proc/&lt;pid&gt;/fd/*</code> links every 25ms, and if a link is open to <code class="language-plaintext highlighter-rouge">/proc/&lt;malware pid&gt;/maps</code> or <code class="language-plaintext highlighter-rouge">/proc/&lt;malware pid&gt;/smaps</code> or  <code class="language-plaintext highlighter-rouge">/proc/&lt;malware pid&gt;/mem</code> it:</p>
+<ul>
+  <li>kills the offending process,</li>
+  <li>deletes any writeable file handle it had opened (before it was killed) in <code class="language-plaintext highlighter-rouge">/proc/&lt;pid&gt;/fd/</code>, first trying to wipe it,</li>
+  <li>calls the self destruct command (0x1701).</li>
+</ul>
+
+<h1 id="further-forensics">Further forensics</h1>
+<p>Lets go back to that awful Saturday I triggered the self-destruct. Having a faint understanding I triggered something (that being before I reversed the devil) I asked Klaus to disconnect all the network connections to the outer world and we started taking memory dumps of whatever we could, storing them all on the laptop.
+In hindsight we destroyed quiet a bit of evidence by triggering more self destructs in other subnets, but I think the self destruct signal has already gone out to the bad guys through a different piece of malware that I later partially recovered, and probably "heard" the UDP distress signal (that's what is was called in the binary, not my naming).</p>
+
+<p>After getting all the forensics the client insisted on reconnecting his systems to the web, they were "losing money". I switched from forensics to reversing.  In the process, while inspecting the malicious <code class="language-plaintext highlighter-rouge">libfsalvfs.so</code> I discovered the commands I mentioned above, and discovered a "feature" that helped me fill more paces of the puzzle.</p>
+
+<p>Reversing malware you always find some feeble attempt to obfuscate string using XOR or RC4, or just scrambling the letter ordering. In this case I pretty quickly found a function I called <code class="language-plaintext highlighter-rouge">get_obfuscated_string(buffer, string_id)</code>. The difference however, was that this one was just horrendous, practically irreversible:</p>
+
+<p><img src="/images/im70_obs1.png" alt="NFS capture hist" /></p>
+
+<p>It had like a billion nested switches:</p>
+
+<p><img src="/images/im71_obs2.png" alt="NFS capture hist" /></p>
+
+<p>I think they let some intern fresh out of college write that one. It seems the complete list of strings used by the tool are encoded inside in a <em>tree</em> of nested switches, with a variable length encoding, e.g. in one branch the 2nd level might have 3 bits and in another it might have 5 and in a third only a single bit. Some kind of prefix tree if I remember anything from Uni.</p>
+
+<p>Eventually I managed to write code to just brute force the function:</p>
+<div class="language-cpp highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="cp">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/stat.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string&gt;
+#include &lt;set&gt;
+</span>
+<span class="kt">int</span> <span class="nf">main</span><span class="p">(</span><span class="kt">int</span> <span class="n">argc</span><span class="p">,</span> <span class="kt">char</span><span class="o">*</span> <span class="n">argv</span><span class="p">[])</span>
+<span class="p">{</span>
+	<span class="c1">// error handling code omitted</span>
+	<span class="k">const</span> <span class="kt">char</span><span class="o">*</span> <span class="n">filename</span> <span class="o">=</span> <span class="p">(</span><span class="n">argc</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="o">?</span> <span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">:</span> <span class="s">"reconstructed.elf"</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">offset</span> <span class="o">=</span> <span class="p">(</span><span class="n">argc</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="o">?</span> <span class="n">strtol</span><span class="p">(</span><span class="n">argv</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">16</span><span class="p">)</span> <span class="o">:</span> <span class="mh">0x22a0</span><span class="p">;</span>
+
+	<span class="kt">int</span> <span class="n">fd</span> <span class="o">=</span> <span class="n">open</span><span class="p">(</span><span class="n">filename</span><span class="p">,</span> <span class="n">O_RDONLY</span><span class="p">);</span>
+	<span class="k">struct</span> <span class="nc">stat</span> <span class="n">stbuf</span><span class="p">;</span>
+	<span class="n">fstat</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">stbuf</span><span class="p">);</span>
+	<span class="k">const</span> <span class="kt">char</span><span class="o">*</span> <span class="n">addr</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="n">mmap</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">stbuf</span><span class="p">.</span><span class="n">st_size</span><span class="p">,</span> <span class="n">PROT_READ</span> <span class="o">|</span> <span class="n">PROT_EXEC</span><span class="p">,</span> <span class="n">MAP_PRIVATE</span><span class="p">,</span> <span class="n">fd</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+	<span class="k">const</span> <span class="kt">char</span><span class="o">*</span> <span class="n">base</span> <span class="o">=</span> <span class="n">addr</span> <span class="o">+</span> <span class="n">offset</span><span class="p">;</span>
+
+	<span class="k">typedef</span> <span class="kt">int</span> <span class="p">(</span><span class="o">*</span><span class="n">entry_t</span><span class="p">)(</span><span class="kt">char</span><span class="o">*</span> <span class="n">outbuf</span><span class="p">,</span> <span class="kt">int</span> <span class="n">id</span><span class="p">);</span>
+	<span class="n">entry_t</span> <span class="n">entry</span> <span class="o">=</span> <span class="p">(</span><span class="n">entry_t</span><span class="p">)</span><span class="n">base</span><span class="p">;</span>
+	<span class="n">std</span><span class="o">::</span><span class="n">set</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&gt;</span> <span class="n">found</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">buffer</span><span class="p">[</span><span class="mi">1024</span><span class="p">];</span>
+	
+	<span class="k">for</span><span class="p">(</span><span class="kt">long</span> <span class="n">bits</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span> <span class="n">bits</span> <span class="o">&lt;</span> <span class="mi">64</span><span class="p">;</span> <span class="o">++</span> <span class="n">bits</span><span class="p">)</span> <span class="p">{</span>
+		<span class="kt">bool</span> <span class="n">any_new</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+		<span class="k">for</span><span class="p">(</span><span class="kt">long</span> <span class="n">id</span> <span class="o">=</span> <span class="p">(</span><span class="n">bits</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="o">?</span> <span class="mi">0</span> <span class="o">:</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="p">(</span><span class="n">bits</span> <span class="o">-</span> <span class="mi">1</span><span class="p">));</span> <span class="n">id</span> <span class="o">&lt;</span> <span class="p">(</span><span class="mi">1</span><span class="o">&lt;&lt;</span><span class="n">bits</span><span class="p">);</span> <span class="o">++</span> <span class="n">id</span><span class="p">)</span> <span class="p">{</span>
+			<span class="kt">int</span> <span class="n">status</span> <span class="o">=</span> <span class="n">entry</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+			<span class="k">if</span><span class="p">(</span><span class="n">status</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="k">if</span><span class="p">(</span><span class="n">found</span><span class="p">.</span><span class="n">find</span><span class="p">(</span><span class="n">buffer</span><span class="p">)</span> <span class="o">!=</span> <span class="n">found</span><span class="p">.</span><span class="n">end</span><span class="p">())</span>
+				<span class="k">continue</span><span class="p">;</span>
+			<span class="n">found</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="n">buffer</span><span class="p">);</span>
+			<span class="n">printf</span><span class="p">(</span><span class="s">"Got '%s'! [0x%x]</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">buffer</span><span class="p">,</span> <span class="n">id</span><span class="p">);</span>
+			<span class="n">any_new</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+		<span class="p">}</span>
+		<span class="k">if</span><span class="p">(</span><span class="o">!</span><span class="n">any_new</span><span class="p">)</span>
+			<span class="k">break</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div></div>
+
+<p>This first binary had the following strings (I am keeping 3 to myself as they have client related info):</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>'/proc/self/mem', 
+'/proc/self/maps',
+'/proc/self/cwd',
+'/proc/self/environ',
+'/proc/self/fd/%d',
+'/proc/self/fdinfo/%d',
+'/proc/self/limits',
+'/proc/self/cgroup',
+'/proc/self/exe',
+'/proc/self/cmdline',
+'/proc/self/mounts',
+'/proc/self/smaps',
+'/proc/self/stat',
+'/proc/%d/mem', 
+'/proc/%d/maps',
+'/proc/%d/cwd',
+'/proc/%d/environ',
+'/proc/%d/fd/%d',
+'/proc/%d/fdinfo/%d',
+'/proc/%d/limits',
+'/proc/%d/cgroup',
+'/proc/%d/exe',
+'/proc/%d/cmdline',
+'/proc/%d/mounts',
+'/proc/%d/smaps',
+'/proc/%d/stat',        
+'nfs',
+'nfs4',
+'tmpfs',
+'devtmpfs',
+'procfs',
+'sysfs',
+'WSL2',
+'/etc/os-release',
+'/etc/passwd',
+'/etc/lsb-release',
+'/etc/debian_version',
+'/etc/redhat-release',
+'/home/%s/.ssh',
+'/var/log/wtmp',
+'/var/log/syslog',
+'/var/log/auth.log',
+'/var/log/cron.log',
+'/var/log/syslog.log',
+'/etc/netplan/*.yaml',
+'/etc/yp.conf',
+'/var/yp/binding/',
+'/etc/krb5.conf',
+'/var/kerberos/krb5kdc/kdc.conf',
+'/var/log/ganesha.log',
+'/etc/ganesha/ganesha.conf',
+'/etc/ganesha/exports',
+'/etc/exports',
+'Error: init failed',
+'DELL',
+'/usr/lib/x86_64-linux-gnu/libnfs.so.4',
+'/tmp/.Test-unix/.fa76c5adb8c04239ff3034106842773b',
+'Error: config missing',
+'Error: sysdep missing',
+'Running',
+'LOG',
+'/usr/lib/x86_64-linux-gnu/ganesha/libfsalvfs.so',
+'none',
+'/etc/sudoers',
+'/proc/net/tcp',
+'/proc/net/udp',
+'/etc/selinux/config',
+'libdl.so.2',
+'libc-',
+'.so',
+'cluster-config',
+'recovery-signal',
+</code></pre></div></div>
+
+<h1 id="eureka-moment">Eureka Moment</h1>
+<p>Staring endlessly at this weird function I thought to myself: maybe I can look for code that is structured like this in all the dumps we obtained. We have all those block of <code class="language-plaintext highlighter-rouge">mov byte ptr [rdi+?], '?'</code>:</p>
+
+<p><img src="/images/im72_rdi.png" alt="MoveRDI" /></p>
+
+<p>So lets look for blocks of code that are highly dense with these opcodes:</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">import</span> <span class="n">sys</span>
+
+<span class="n">with</span> <span class="n">open</span><span class="p">(</span><span class="n">sys</span><span class="p">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="err">'</span><span class="n">rb</span><span class="err">'</span><span class="p">)</span> <span class="n">as</span> <span class="n">f</span><span class="o">:</span>
+    <span class="n">data</span> <span class="o">=</span> <span class="n">f</span><span class="p">.</span><span class="n">read</span><span class="p">()</span>
+
+<span class="n">STATE</span><span class="o">=</span><span class="n">None</span>
+<span class="k">for</span> <span class="n">i</span> <span class="n">in</span> <span class="n">range</span><span class="p">(</span><span class="n">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span> <span class="o">-</span> <span class="mi">6</span><span class="p">)</span><span class="o">:</span>
+    <span class="k">if</span> <span class="n">ord</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="o">==</span> <span class="mh">0xc6</span> <span class="n">and</span> <span class="n">ord</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">])</span> <span class="o">==</span> <span class="mh">0x47</span><span class="o">:</span>
+        <span class="k">if</span> <span class="n">STATE</span> <span class="n">and</span> <span class="p">(</span><span class="n">STATE</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="n">STATE</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="mh">0x40</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">i</span><span class="o">:</span>
+            <span class="n">STATE</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">i</span> <span class="o">-</span> <span class="n">STATE</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">STATE</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">else</span><span class="o">:</span>
+            <span class="k">if</span> <span class="n">STATE</span> <span class="n">and</span> <span class="n">STATE</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="mi">20</span><span class="o">:</span>
+                <span class="n">print</span><span class="p">(</span><span class="err">'</span><span class="n">Found</span> <span class="n">region</span> <span class="n">at</span> <span class="mi">0</span><span class="n">x</span><span class="o">%</span><span class="n">x</span> <span class="o">-</span> <span class="mi">0</span><span class="n">x</span><span class="o">%</span><span class="n">x</span><span class="err">'</span> <span class="o">%</span> <span class="p">(</span><span class="n">STATE</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">STATE</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="n">STATE</span><span class="p">[</span><span class="mi">1</span><span class="p">]))</span>
+            <span class="n">STATE</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">1</span><span class="p">]</span> 
+</code></pre></div></div>
+
+<p>And I found them. Oh I did. Some adjustment even led to a version for ARM systems:</p>
+
+<p><img src="/images/im72_arm.png" alt="MoveRDIARM" /></p>
+
+<h1 id="the-golang-thingy">The GOlang thingy</h1>
+
+<p>I finally found the payload that was sent over to the GW machines. It had 2 stages: the first was the 8192 buffer loaded through the first covert channel. The kernel was modified to inject this buffer into the GOlang application and hook it. This will get fairly technical, but I enjoyed it and so will you:</p>
+
+<ul>
+  <li>First note that in the Golang stdlib an HTTP connection can be read through the <code class="language-plaintext highlighter-rouge">net/http.(connReader).Read</code> function. The calls are made through a <code class="language-plaintext highlighter-rouge">io.Reader</code> interface, so the calls are made through a virtual table, and the call locations cannot be statically identified.</li>
+  <li>the kernel inject begins by allocating a bunch of RWX memory immediately after the GOlang binary - let's call it the trampoline area, and it will include two types of generated trampoline functions,</li>
+  <li>Next the ELF symbol table was used to find the 'net/http.(*connReader).Read' symbol,</li>
+  <li>What we’ll call the 1st trampoline function (code below) is copied to the trampoline area, patching the area marked with <code class="language-plaintext highlighter-rouge">HERE</code> with the first 9 bytes of <code class="language-plaintext highlighter-rouge">net/http.(\*connReader).Read</code></li>
+  <li><code class="language-plaintext highlighter-rouge">mprotect(net_http_connReader_read &amp; ~0xfff, 8192, PROT_EXEC | PROT_READ | PROT_WRITE)</code></li>
+  <li>modified the beginning of <code class="language-plaintext highlighter-rouge">net/http.(\*connReader).Read</code> to a near jump into the trampoline - using 5 bytes of the 9 original used by 'move rcx, fs:….' that are the preamble to function.</li>
+</ul>
+
+<p>First trampoline function</p>
+<div class="language-nasm highlighter-rouge"><div class="highlight"><pre class="highlight"><code>     <span class="nf">pop</span>     <span class="nb">rax</span>            
+     <span class="nf">pop</span>     <span class="nb">rcx</span>
+     <span class="nf">push</span>    <span class="nb">rcx</span>
+     <span class="nf">push</span>    <span class="nb">rax</span>
+     <span class="nf">mov</span>     <span class="nv">r11</span><span class="p">,</span> <span class="nb">cs</span><span class="p">:</span><span class="kt">qword</span><span class="nv">_</span><span class="o">&lt;</span><span class="nv">relocated</span><span class="o">&gt;</span>
+     <span class="nf">mov</span>     <span class="nb">rdi</span><span class="p">,</span> <span class="nb">rcx</span>
+     <span class="nf">call</span>    <span class="kt">qword</span> <span class="nv">ptr</span> <span class="p">[</span><span class="nv">r11</span><span class="o">+</span><span class="mi">8</span><span class="p">]</span>
+     <span class="nf">pop</span>     <span class="nb">rax</span>
+     <span class="nf">pop</span>     <span class="nb">rcx</span>
+     <span class="nf">push</span>    <span class="nb">rcx</span>
+     <span class="nf">mov</span>     <span class="nb">rcx</span><span class="p">,</span> <span class="nb">fs</span><span class="p">:</span><span class="mh">0FFFFFFFFFFFFFFF8h</span> <span class="o">&lt;----</span> <span class="nv">HERE</span>
+     <span class="nf">cmp</span>     <span class="nb">rsp</span><span class="p">,</span> <span class="p">[</span><span class="nb">rcx</span><span class="o">+</span><span class="mh">10h</span><span class="p">]</span>
+     <span class="nf">jmp</span>     <span class="nb">rax</span>
+</code></pre></div></div>
+
+<ul>
+  <li>When the trampoline is called (from the new near jump in the beginning of <code class="language-plaintext highlighter-rouge">net/http.(*connReader).Read</code>) it examines the stack to locate the return address, and checks if a second type of trampoline we'll refer to as the <strong>return trampoline</strong> has already been allocated for the return address for the function,</li>
+  <li>If not it allocates a new trampoline per call location of <code class="language-plaintext highlighter-rouge">net/http.(*connReader).Read</code> from the code below, replacing 123456789ABCDEFh with the absolute address of a function in the malware,</li>
+  <li>GOlang uses memory for all function argument passing, so immediately after the virtual function call to <code class="language-plaintext highlighter-rouge">Read()</code> there will always be a 5 byte <code class="language-plaintext highlighter-rouge">mov     reg, [rsp+?]</code> to load <code class="language-plaintext highlighter-rouge">Read()</code>'s result into a register. This <code class="language-plaintext highlighter-rouge">mov</code> instruction is copied into the first <code class="language-plaintext highlighter-rouge">db 5 dup(0)</code> area,</li>
+  <li>those same 5 bytes are then replacing with a near jump to the 2nd trampoline</li>
+  <li>the 2nd db 5 dup(0) are filled with a relative near <code class="language-plaintext highlighter-rouge">jmp</code> back to the original code patch site.
+    <div class="language-nasm highlighter-rouge"><div class="highlight"><pre class="highlight"><code>    <span class="nf">mov</span>     <span class="nb">rax</span><span class="p">,</span> <span class="mh">123456789ABCDEFh</span>
+    <span class="nf">mov</span>     <span class="nb">rdi</span><span class="p">,</span> <span class="nb">rsp</span>
+    <span class="nf">call</span>    <span class="nb">rax</span>
+    <span class="kd">db</span> <span class="mi">5</span> <span class="nv">dup</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+    <span class="kd">db</span> <span class="mi">5</span> <span class="nv">dup</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>      
+</code></pre></div>    </div>
+  </li>
+</ul>
+
+<p>This way eventually all the <code class="language-plaintext highlighter-rouge">net/http.(*connReader).Read</code> call sites are patched to call a function immediatly after <code class="language-plaintext highlighter-rouge">net/http.(*connReader).Read</code> virtual call returns. This lets the malicous code inspect the decoded HTTP packet.</p>
+
+<p>On initialization the 1st stage malware also loads the hefty 2nd stage through the 2nd covert channel, and passes each buffer received from the patch on <code class="language-plaintext highlighter-rouge">net/http.(*connReader).Read</code> to it for inspection.
+The data collected is collected and compressed by the malware and stored back to the NFS server (the 2nd covert channel which bypasses read ACLs on NFS).</p>
+
+<p>Before this case I did not think there was any nice way to hook random GO binaries, this technique is pretty cool.</p>
+
+<p>Unfortunatly I cannot discuss what the 2nd payload actually as it will reveal stuff my employer isn't ready for yet.</p>
+
+<h1 id="how-the-kernel-got-patched-and-why-not-the-golang-app">How the kernel got patched? and why not the golang app?</h1>
+<p>The golang app is built inside the CI/CD network segment. This segment can only be accessed through monitored jump hosts with MFA. Each day, the CI/CD pipline clones the source code from the GIT server, builds it, and automatically tests it in a pre-production segment. Once tested it gets digitally signed and uploaded to the NFS server. The running app self updates, checking the digital signature beforehand.</p>
+
+<p>The kernel, on the other hand, is manually built by the guy responsible for it on his own laptop. He then digitally signs it and stores it on a server where it is used by the CI/CD pipeline. Fortunatly for us a commented out line in a script in the CI/CD pipline (a line that was not commented out in the GIT!) did not delete old versions of the kernel and we know which versions were tampered with.</p>
+
+<p>We noticed a 3 month gap about 5 month ago, and it corresponded with the guy moving the kernel build from a Linux laptop to a new Windows laptop with a VirtualBox VM in it for compiling the kernel. It looks as if it took the attackers three months to gain access back into the box and into the VM build.</p>
+
+<h1 id="what-we-have-so-far">What we have so far</h1>
+
+<p>We found a bunch of malware sitting in the network collecting PII information from incoming HTTPS connection after they are decoded in a GOlang app. The data is exfiltrated through the malware network and eventually is sent to the bad guys.
+We have more info but I am still working on it, expect another blog post in the future with more details, samples, etc’.</p>
+
+<h1 id="qa">Q&amp;A</h1>
+
+<ul>
+  <li>
+    <p><strong>Q</strong>: What was the initial access vector?</p>
+
+    <p><strong>A</strong>: We have a pretty good idea, but I cannot publish it yet (RD and stuff). Stay tuned!</p>
+  </li>
+  <li>
+    <p><strong>Q</strong>: Why didn't you upload anything to VT yet?</p>
+
+    <p><strong>A</strong>: A few reasons:</p>
+    <ul>
+      <li>I need to make sure no client info is in the binaries - some of the binaries have hardcoded strings that cannot be shared</li>
+      <li>All of the binaries I have have been reconstructed from memory dumps, so are not in their original form. Does anyone know how to upload partial dumps into VT?</li>
+    </ul>
+  </li>
+  <li>
+    <p><strong>Q</strong>: It there a security vulnerability in GO? in the Kernel?</p>
+
+    <p><strong>A</strong>: Defenitly not! this is just an obnoxious attacker doing what obnoxious attacker do. I might even say the complexity of the stuff means they don’t have a 0day for this platform.</p>
+  </li>
+  <li>
+    <p><strong>Q</strong>: What about YARA rules, C2 address, etc'?</p>
+
+    <p><strong>A</strong>: Wait for it, there is a lot more coming!</p>
+  </li>
+  <li>
+    <p><strong>Q</strong>: Why did you publish instead of collecting more?</p>
+
+    <p><strong>A</strong>: To quote the client "I don't care who else they are attacking. I just want them off my lawn!", and he thinks publishing will prevent them from returning to <strong>THIS</strong> network. 
+   Hopefully what we publish next time will get them off other people’s lawns.</p>
+  </li>
+  <li>
+    <p><strong>Q</strong>: Any Windows malware?</p>
+
+    <p><strong>A</strong>: Definitly, including what we believe is an EDR bypass. Still working on it.</p>
+  </li>
+  <li>
+    <p><strong>Q</strong>: Any zero days?</p>
+
+    <p><strong>A</strong>: Maybe …</p>
+  </li>
+  <li>
+    <p><strong>Q</strong>: Who are these bad guys you keep refering to?</p>
+
+    <p><strong>A</strong>: No clue. Didn’t find anything similiar published. There is now sure way to make anything except unsubstantiated guesses, and I won’t do that.</p>
+  </li>
+</ul>
+
+<p><strong>To be continued.</strong></p>
+
+
+        
+      </section>
+
+      <footer class="page__meta">
+        
+        
+
+
+        
+  <p class="page__date"><strong><i class="fas fa-fw fa-calendar-alt" aria-hidden="true"></i> Updated:</strong> <time datetime="2021-03-24T00:00:00-04:00">March 24, 2021</time></p>
+
+
+      </footer>
+
+      
+
+      
+  <nav class="pagination">
+    
+      <a href="/2021/02/24/graphics-part2.html" class="pagination--pager" title="Security of the Intel Graphics Stack - Part 2 - FW &lt;-&gt; GuC
+">Previous</a>
+    
+    
+      <a href="#" class="pagination--pager disabled">Next</a>
+    
+  </nav>
+
+    </div>
+
+    
+  </article>
+
+  
+  
+</div>
+
+    </div>
+
+    
+
+    <div id="footer" class="page__footer">
+      <footer>
+        <!-- start custom footer snippets -->
+
+<!-- end custom footer snippets -->
+        <div class="page__footer-follow">
+  <ul class="social-icons">
+    
+
+    
+
+    
+      <li><a href="/feed.xml"><i class="fas fa-fw fa-rss-square" aria-hidden="true"></i> Feed</a></li>
+    
+  </ul>
+</div>
+
+<div class="page__footer-copyright">&copy; 2021 Igor's Blog. Powered by <a href="https://jekyllrb.com" rel="nofollow">Jekyll</a> &amp; <a href="https://mademistakes.com/work/minimal-mistakes-jekyll-theme/" rel="nofollow">Minimal Mistakes</a>.</div>
+
+      </footer>
+    </div>
+
+    
+  <script src="/assets/js/main.min.js"></script>
+
+
+
+
+
+
+
+
+
+
+  </body>
+</html>
