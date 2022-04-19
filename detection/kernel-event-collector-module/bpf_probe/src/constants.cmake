@@ -1,0 +1,1 @@
+set(CHECK_PROBE_KIT_FILE check-probe-$ENV{BUILD_VERSION})

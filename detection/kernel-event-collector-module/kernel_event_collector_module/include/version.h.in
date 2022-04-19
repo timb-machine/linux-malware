@@ -1,0 +1,15 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+// Copyright (c) 2019-2020 VMware, Inc. All rights reserved.
+// Copyright (c) 2016-2019 Carbon Black, Inc. All rights reserved.
+
+#pragma once
+
+#define MEM_CACHE_PREFIX      "@MEM_CACHE_PREFIX@"
+#define CB_APP_MODULE_NAME    "@MODULE_NAME@"
+#define MODULE_NAME           @MODULE_NAME@
+#define CB_APP_MODULE_DEVICE  "/dev/@MODULE_NAME@"
+#define CB_APP_PROC_DIR       "@PROC_DIR@"
+#define CB_APP_DEBUG_PREFIX   "@DEBUG_PREFIX@"
+#define CB_APP_VERSION_STRING "@VERSION_STRING@"
+#define CB_APP_BUILD_DATE     "@BUILD_DATE@"
+#define CB_APP_API_VERSION    @API_VERSION@

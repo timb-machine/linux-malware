@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - '*.md'
+
+  pull_request:
+    paths-ignore:
+      - '*.md'
+      
+  workflow_dispatch:
+    paths-ignore:
+      - '*.md'
+
+jobs:
+  alpine_arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: alpine_latest
+          run: apk update && apk add bash zsh
+      - uses: ./.github/actions/test
+
+  debian_arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: bullseye
+          run: apt-get update && apt-get install -y busybox zsh && ln -sf /bin/busybox /bin/ash
+      - uses: ./.github/actions/test
+
+  arch_arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: archarm_latest
+          run: pacman -Sy --noconfirm busybox zsh which && ln -sf /bin/busybox /bin/ash
+      - uses: ./.github/actions/test

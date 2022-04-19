@@ -1,0 +1,5 @@
+#!/bin/sh
+ksyms=`cat /proc/kallsyms | grep -v module | grep kallsyms_lookup_name | awk -F ' ' '{print $1}'`
+ksyms_lookup="0x$ksyms"
+echo "Using $ksyms_lookup for kallsyms_lookup_name()"
+/sbin/insmod jkit.ko ksyms_lookup=$ksyms_lookup

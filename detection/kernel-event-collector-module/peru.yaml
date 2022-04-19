@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2019-2020 VMware, Inc. All rights reserved.
+# Copyright (c) 2016-2019 Carbon Black, Inc. All rights reserved.
+
+imports:
+    build-util: build-util
+
+git module build-util:
+    url:  git@gitlab.bit9.local:cbsensor/cb-build-util.git
+    rev:  master

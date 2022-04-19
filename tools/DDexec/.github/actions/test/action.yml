@@ -1,0 +1,7 @@
+name: 'Testing...'
+description: 'Runs a bunch of tests'
+runs:
+  using: "composite"
+  steps:
+    - run: bash .github/actions/test/test.sh
+      shell: bash
