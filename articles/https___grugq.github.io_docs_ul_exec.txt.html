@@ -1,0 +1,274 @@
+        The Design and Implementation of Userland Exec
+
+                        by the grugq
+
+Abstract:
+
+This paper examines a mechanism to execute a binary without the use of the
+syscall execve(). The design for this mechanism is simple: clean up the
+address space; check for, and load, the dynamic linker; load the binary; set
+up the stack; locate the entry point, and transfer control of execution. One
+implemenation of this mechanism is used to illustrate this design.
+
+Introduction:
+
+Userland exec replaces the existing process image within the current address
+space with a new one. In this, userland exec mimics the behavior of the
+system call execve()*. However, because it operates in userland, the kernel
+process structures which describe the process image remain unchanged. This
+means that the process name reported by system utilities will be the old
+process name, etc.
+
+The ability to load a new process image without the direct aid of the kernel
+is important in many scenarios. For example: a program (e.g. shellcode) could
+load a binary off the wire and execute it without first creating a copy on
+disk; or, a program could extract a binary from an encrypted data store and
+execute it without creating a plain text image on the disk. Userland exec is
+useful for any situation where it is preferable not to create a file on the
+disk when executing a program.
+
+This paper will describe the design and implementation of the userland exec
+code. First it will discuss how execve() creates a new process image, and what
+this process image looks like (including the stack layout). Based on this
+knowledge the design of the userland exec code will be examined, using the
+userland exec implementation to illustrate concepts.
+
+*) This implementation of userland exec is specific to ELF binaries on i386
+Linux systems, however the methodology outlined is universal across Unix-like
+systems.
+
+Background:
+
+When a Unix program wants to execute another program it will use the execve()
+system call to load the new program as a process image (creating the new
+process via fork() is ignored here). The man page for the exec family of
+function calls (execl() and the other wrappers for execve()) describes what
+happens: "[t]he exec family of functions replaces the current  process image
+with a new process image." A more complete picture of what happens when a
+process image is replaced can be found in the execve() man page:
+
+       execve() does not return on success, and the  text,  data,
+       bss,  and  stack of the calling process are overwritten by
+       that [sic] of the program loaded. 
+
+Clearly, the program which calls execve() is taken out of memory and the new
+program loaded. When this happens, the .text and .data segments as well as the
+heap and the stack are replaced. Any implementation of userland exec would
+have to remove the old process' text, data and heap, and reset the stack.
+
+To design a userland exec implementation, a more detailed description of how
+execve() operates is required. This more detailed description of how a new
+process image is created from an ELF binary would be: 
+
+First, execve() cleans the address space of the current process by unmapping
+all of the pages of memory which form the existing image. If the executable is
+dynamically linked -- that is, if it uses run time libraries provided by the
+system -- the dynamic linker is loaded into memory. The main ELF executable is
+then mapped into the process address space. The stack is initialized with the
+environmental variables and the other parameters to main(). The stack is also
+initialized with arguments for the dynamic linker to allow it to locate the
+binary in memory. Finally, the kernel determines the correct entry point:
+either the dynamic linker, if it is loaded, or the main binary, if it is
+not.The kernel then transfers execution to this entry point.
+
+This more detailed description provides a blueprint for the userland exec
+implementation. However, some specific details still need to be clarified:
+in particular the exact layout of the stack just after the image is created.
+The diagram below roughly illustrates this stack layout.
+
+          -----------------------------------------
+                        [ 0 ]  <-- top of the stack
+                        [ envp strings ]
+                        [ 0 ]
+                        [ argv strings ]
+                        [ 0 ]
+                        [ auxv ]
+                        [ 0 ]
+                        [ envp ]
+                        [ 0 ]
+                        [ argv ]
+                        [ argc ] <-- stack pointer
+          -----------------------------------------
+
+At the top of the stack are the environmental and argument strings. The bottom
+of the stack starts with the argument count, then come the argument
+pointerarray and the environmental pointer array.  In the middle is the
+Elf_aux vector. This array of data structures provides information to the
+dynamic linker about the process image, e.g. the location of the program
+header table.
+
+The dynamic linker is responsible for relocating the ELF binary, if required,
+as well as loading all the necessary libraries and performing run time symbol
+resolution. For more information on dynamic linkers see [Levine 1999],
+[grugq 2001] and [grugq & scut 2001].
+
+Design:
+
+With a clear understanding of how execve() creates a new process image, it is
+possible to enumerate a list of steps that a userland implementation must
+follow. That list is:
+
+1. Clean out the address space
+2. If the binary is dynamically linked, load the dynamic linker
+3. Load the binary
+4. Initialize the stack
+5. Determine the entry point (i.e. the dynamic linker or the main executable)
+6. Transfer execution to the entry point
+
+Note: the second and third step are actually interchangeable.
+
+Implementation:
+
+Step 0, preserving arguments to main()
+
+When userland exec is invoked, it accepts arguments to the main() function of
+the new program. While building the new process image, userland exec will
+reset the stack and potentially damage those parameters. For this reason, the
+first thing that userland exec must do is preserve these arguments for later
+use. In this implementation, the arguments are stored in tables allocated with
+mmap(). The contents of these tables can then be copied back into the stack
+when it is being initialized for the new process image.
+
+Step 1, clean out the address space
+
+To prepare the address space for a new process image userland exec needs to
+clean out only certain address ranges, not the entire old image. The address
+range of primary importance is the one to which the new program binary has
+been relocated. On i386 Linux systems, this address is usually 0x08048000. The
+.text segment, and the .data segment, of the current process's binary will be
+mapped to this location. Following the .data segment will be the .bss, and
+following that, the heap. Userland exec must therefore map the old executable
+down, in addition to mapping down the old heap. Depending on the state of the
+program, the heap can be of varying size.
+
+The userland exec implementation must determine where the memory range which
+comprises the .text, .data and heap, begins and ends so that it can map the
+range down. There are several different ways of determining this range. In
+some instances, for a specific target, it is possible to hard-code the values.
+For a more generic approach, one approach might be to register a signal
+handler and start probing the address space, e.g. to determine the end of the
+heap. Using the hard coded start address of 0x08048000 and the probed heap
+size, userland exec could map down this range.
+
+In this implementation, userland exec uses the process maps file maintained by
+the kernel to determine the location and size of the process' .text and .data
+segments and the heap. Convieniently, under Linux, the first three lines of
+the /proc/self/maps file contain the .text segment, the .data segment and the
+heap. By mapping down the first three memory segments listed in the maps file
+userland exec can clean the range required for the new .text and .data
+segments, and the new heap.
+
+Step 2, check for, and load, the dynamic linker
+
+Determining whether a given ELF binary requires a dynamic linker, or not, is
+incredibly straightforward. The execve() man pages describe the exact method
+used by the kernel (and by userland exec) to check for a dynamic linker.
+
+       If the executable is a dynamically-linked ELF  executable,
+       the  interpreter named in the PT_INTERP segment is used to
+       load the needed shared  libraries.
+
+The dynamic linker is only required for those processes which utilize shared
+libraries from the system. If a binary requires dynamic linking, the path
+to the desired dynamic linker will be stored in a special program header
+segment: PT_INTERP. By searching the program header table of the new ELF
+image, userland exec can determine whether a dynamic linker is required, and,
+simultaneously, which dynamic linker to load. Loading the linker after this is
+trivial, requiring only an understanding of how ELF binaries are loaded into
+memory. The next section will discuss how this is done.
+
+Step 3, load the main binary
+
+The principle for loading an ELF binary is the same regardless of whether the
+binary is loaded from a memory buffer or off the disk. For each PT_LOAD
+segment in the program header table, the loader ensures that the ELF image
+from p_offset for p_filesz bytes is copied into a memory buffer (with p_flags
+permissions) at p_vaddr of p_memsz (aligned to p_align) bytes. That is, each
+PT_LOAD segment essentially says "this part of the ELF goes into this part of
+the memory image".
+
+The userland exec implementation scans the program header table and determines
+the total amount of memory the loaded ELF will occupy. This simply means
+aligning the p_memsz values of all the PT_LOAD segments using p_align, then
+adding them together. The userland exec code then allocates a memory range
+starting from the first PT_LOAD segment's p_vaddr for the total length
+previously calculated. With the memory now reserved, all that remains is to
+copy the PT_LOAD segments into their appropriate ranges and then set the
+segment permissions based on their p_flags.
+
+Step 4, initialize the stack
+
+With the main binary, and any dynamic linker, loaded into memory, the last
+major task which still remains is setting up the stack. The stack, at program
+start up, has a strict format examined briefly above. To initialize the
+stack, userland exec must reset the stack pointer. Performing this is simply
+a matter of calculating the size of the stack contents (the argv strings,
+environmental strings, auxv, etc. etc.) and subtracting this value from the
+stack base. With the space allocated for the new parameters, userland exec can
+begin creating the stack layout.
+
+To create the stack layout the userland exec implementation must extract the
+saved parameters for the main() function (argc, argv and envp) and copy them
+to the stack. This can trivially be accomplished using the saved parameters
+from step 0 and some simple pointer arithmetic. The Elf_Aux vector is the only
+data structure which requires some explanation. This vector contains data
+which the dynamic linker needs in order to integrate with the process image
+correctly. There are only a few key pieces of information required by the
+dynamic linker to perform its task. These are: its own load address (AT_BASE);
+the location of the program header table (AT_PHDR), as well as the number of
+program headers (AT_PHNUM); the size of a page of memory (AT_PAGESZ); any
+flags to alter its run time behavior (AT_FLAGS), and the entry point for the
+main executable (AT_ENTRY).
+
+Step 5, determine entry point
+
+Locating the correct entry point for the new process image is very straight
+forward. If a dynamic linker was loaded, then the entry point is the load
+address of the linker plus the e_entry value, otherwise it is the main ELF's
+e_entry.
+
+Step 6, transfer control of execution
+
+The final step is to start the new process image running by transferring
+control of execution to the entry point located during step 5.
+
+These six steps are all that are required to load an arbitrary ELF binary into
+an address space and execute it.
+
+Conclusion:
+
+It has been shown that the execve() system call can be mimicked in userland 
+with a minimum of difficulty. Creating a new process image is a simple matter
+of: cleaning out the address space; checking for, and loading, the dynamic
+linker; loading the binary; initializing the stack; determining the entry
+point and, transferring control of execution.  By following these six steps,a
+new process image can be created and run. Using this implementation as a start
+point, it is possible to create both smaller, and also more elaborate,userland
+exec implementations.
+
+History of userland exec:
+
+The author first developed a userland exec implementation in early 2002. The
+initial proof of concept implementation demonstrated that it was indeed
+possible to mimic execve() in userland. However, several limitations in the
+implementation made it unfit for public release. Recently, some people have
+posted incredibly crude mechanisms for executing a new binary in an address
+space occupied by another process image. Given the severe limitations of this
+technique, and the request of a friend for the old proof of concept
+implementation, the author felt compelled to implement a fully functional
+version of userland exec.  Design and implementation took less than 48 hours
+to complete.
+
+Acknowledgments:
+
+As always, the creation of any work is not possible without the help of other
+individuals. Here, then, is a list of those who've been involved in some
+capacity or another in making userland exec: mammon_; gera; duke, and Grendel,
+PhD.  Additionally thanks to those ppl who made .sg so enjoyable Halvar &
+Evelyn, SK, Saumil, Charl and Dave Aitel. And all the ppl who came to my talk.
+
+Bibliography:
+
+http://www.phrack.org/phrack/58/p58-0x05 grugq & scut, 2001
+http://downloads.securityfocus.com/library/subversiveld.pdf  grugq, 2001
+http://www.iecc.com/linker/ levine, 1999

