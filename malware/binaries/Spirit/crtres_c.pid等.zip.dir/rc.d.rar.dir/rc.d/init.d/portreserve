@@ -1,0 +1,95 @@
+#!/bin/sh
+#
+# portreserve  This script starts and stops the TCP port reserver
+# Originally written by Tim Waugh from Red Hat
+# Adapted to Debian by Javier Fernandez-Sanguino
+#
+# chkconfig: 2345 11 89
+# description: TCP port reservation utility
+#
+### BEGIN INIT INFO
+# Provides:          portreserve
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 6
+# Short-Description: Port reservation utility
+# Description:       Portreserve is a TCP port reservation utility
+#                    that can be use to prevent RPC services from 
+#                    picking up well-known reserved ports.
+### END INIT INFO
+
+
+DAEMON=/sbin/portreserve
+
+. /etc/rc.d/init.d/functions
+
+NAME=`basename $DAEMON`
+PIDFILE=/var/run/$NAME.pid
+prog=$NAME
+
+registered_services()
+{
+# Determine if there are any registered services, we return true
+# if the directory exists and there are files that will _not_ be 
+# ignored by portreserve (i.e. files with '~' or '.' in their names)
+	if [ ! -d /etc/$NAME ] ; then
+		return 1
+	fi
+	if [ -z "`find /etc/$NAME \! -name "*~" -a \! -name "*.*" -type f`" ] ; then
+		return 1
+	fi
+	return 0
+}
+
+
+# See how we were called.
+case "$1" in
+  start)
+	[ $UID -eq 0 ] || exit 4
+	echo -n $"Starting $prog: "
+	if registered_services ; then
+	    daemon $DAEMON
+	    RETVAL=$?
+	    echo
+	else
+            echo $"(not starting, no services registered)"
+	    RETVAL=6
+	fi
+        ;;
+  stop)
+        # Stop daemon.
+	[ $UID -eq 0 ] || exit 4
+	echo -n $"Stopping $prog: "
+	RETVAL=0
+	if [ -f "$PIDFILE" ]; then
+            killproc $DAEMON
+	    RETVAL=$?
+        fi
+	[ $RETVAL = 0 ] && rm -f "$PIDFILE"
+	echo
+        ;;
+  restart)
+        $0 stop
+        $0 start
+        ;;
+  condrestart|try-restart)
+	[ -f "$PIDFILE" ] && $0 restart || :
+	;;
+  reload)
+	exit 3
+	;;
+  force-reload)
+	[ -f "$PIDFILE" ] && $0 restart || :
+	;;
+  status)
+	status -p "$PIDFILE" $NAME
+	RETVAL=$?
+	;;
+  *)
+	echo $"Usage: $prog {start|stop|restart|condrestart|status}"
+	if [ "$1" == "usage" ] || [ -z "$1" ]; then
+		exit 0
+	fi
+	exit 2
+esac
+
+exit $RETVAL

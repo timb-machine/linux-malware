@@ -1,0 +1,94 @@
+#! /bin/sh
+### BEGIN INIT INFO
+# Provides: irqbalance 
+# Default-Start:  3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: start and stop irqbalance daemon 
+# Description:  The irqbalance daemon will distribute interrupts across
+#		the cpus on a multiprocessor system with the purpose of
+#		spreading the load
+### END INIT INFO
+# chkconfig: 2345 13 87
+
+
+# This is an interactive program, we need the current locale
+
+# Source function library.
+. /etc/init.d/functions
+
+# Check that we're a priviledged user
+[ `id -u` = 0 ] || exit 0
+
+
+prog="irqbalance"
+
+[ -f /usr/sbin/irqbalance ] || exit 0
+
+# fetch configuration if it exists
+# ONESHOT=yes says to wait for a minute, then look at the interrupt
+# load and balance it once; after balancing exit and do not change
+# it again.
+# The default is to keep rebalancing once every 10 seconds.
+ONESHOT=
+[ -f /etc/sysconfig/irqbalance ] && . /etc/sysconfig/irqbalance
+case "$IRQBALANCE_ONESHOT" in
+	y*|Y*|on) ONESHOT=--oneshot ;;
+	*) ONESHOT= ;;
+esac
+
+RETVAL=0
+
+start() {
+        if [ -n "$ONESHOT" -a -f /var/run/irqbalance.pid ]; then
+                exit 0
+        fi
+        echo -n $"Starting $prog: "
+	if [ -n "$IRQBALANCE_BANNED_CPUS" ];
+	then
+		export IRQBALANCE_BANNED_CPUS=$IRQBALANCE_BANNED_CPUS
+	fi
+        daemon irqbalance --pid=/var/run/irqbalance.pid $IRQBALANCE_ARGS $ONESHOT
+        RETVAL=$?
+        echo
+        return $RETVAL
+}
+
+
+stop() {
+        echo -n $"Stopping $prog: "
+        killproc irqbalance
+        RETVAL=$?
+        echo
+        [ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/irqbalance
+	return $RETVAL
+}
+
+restart() {
+	stop
+	start
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  status)
+	status irqbalance
+	;;
+  restart|reload|force-reload)
+	restart
+	;;
+  condrestart)
+	[ -f /var/lock/subsys/irqbalance ] && restart || :
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|status|restart|reload|condrestart|force-reload}"
+	exit 1
+	;;
+esac
+
+exit $?

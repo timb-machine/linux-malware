@@ -1,0 +1,727 @@
+#! /bin/sh
+### BEGIN INIT INFO
+# Provides: kdump 
+# Default-Start:  3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: start and stop kdump crash recovery service 
+# Description:  The kdump init script provides the support necessary for
+#		loading a kdump kernel into memory at system bootup time,
+#		and for copying away a vmcore at system panic time. 
+### END INIT INFO
+#  Copyright 2005 Red Hat, Inc.
+#
+#  chkconfig: - 20 80
+#
+#  Author:  Jeff Moyer <jmoyer@redhat.com>
+
+
+# Source function library.
+. /etc/init.d/functions
+
+KEXEC=/sbin/kexec
+
+# Will be different for ia64, for example.  For now, that architecture isn't
+# supported.  Code needs to be added here when we do.
+BOOTDIR="/boot"
+
+KDUMP_KERNELVER=""
+KDUMP_COMMANDLINE=""
+KDUMP_IDE_NOPROBE_COMMANDLINE=""
+KEXEC_ARGS=""
+KDUMP_CONFIG_FILE="/etc/kdump.conf"
+MEM_RESERVED=""
+MKDUMPRD_ARGS=""
+CLUSTER_CONFIG_FILE="/etc/cluster/cluster.conf"
+FENCE_KDUMP_CONFIG="/etc/sysconfig/fence_kdump"
+SSH_KEY_LOCATION="/root/.ssh/kdump_id_rsa"
+
+LOGGER="/usr/bin/logger -p info -t kdump"
+
+standard_kexec_args="-p"
+
+if [ -f /etc/sysconfig/kdump ]; then
+	. /etc/sysconfig/kdump
+fi
+
+function single_instance_lock()
+{
+	exec 9>/var/lock/kdump
+	flock 9
+}
+
+# remove_cmdline_param <kernel cmdline> <param1> [<param2>] ... [<paramN>]
+# Remove a list of kernel parameters from a given kernel cmdline and print the result.
+# For each "arg" in the removing params list, "arg" and "arg=xxx" will be removed if exists.
+function remove_cmdline_param()
+{
+	local cmdline=$1
+	shift
+
+	for arg in $@; do
+		cmdline=`echo $cmdline | \
+			 sed -e "s/\b$arg=[^ ]*\b//g" \
+			     -e "s/\b$arg\b//g"`
+	done
+	echo $cmdline
+}
+
+
+function in_xen_pv_guest()
+{
+	grep -q 'xen-percpu-virq  *timer0' /proc/interrupts
+}
+
+function in_xen_hvm_guest()
+{
+	grep -q "xen" /sys/hypervisor/type >& /dev/null && ! grep -q 'xen-percpu-virq  *timer0' /proc/interrupts
+}
+
+function check_xen_hvm_nopv_premkdumprd()
+{
+	if in_xen_hvm_guest; then
+		if grep -q "xen_.*front" /proc/modules; then
+			return 1
+		fi
+	fi
+}
+
+function save_kernel_logs()
+{
+	local _path=$1
+
+	mkdir -p $_path
+
+	if [ ! -f /sbin/vmcore-dmesg ];then
+		$LOGGER "Skipping saving vmcore-dmesg.txt. File /sbin/vmcore-dmesg is not present"
+		return;
+	fi
+
+	echo "kdump: saving vmcore-dmesg.txt to $_path"
+	$LOGGER "saving vmcore-dmesg.txt to $_path"
+	/sbin/vmcore-dmesg /proc/vmcore > $_path/vmcore-dmesg-incomplete.txt
+	if [ $? == 0 ]; then
+		mv $_path/vmcore-dmesg-incomplete.txt $_path/vmcore-dmesg.txt
+		echo "kdump: saved vmcore-dmesg.txt to $_path"
+		$LOGGER "saved vmcore-dmesg.txt to $_path"
+	else
+		echo "kdump: failed to save vmcore-dmesg.txt to $_path"
+		$LOGGER "failed to save vmcore-dmesg.txt to $_path"
+	fi
+
+}
+
+function save_core()
+{
+	local kdump_path
+	kdump_path=`grep ^path $KDUMP_CONFIG_FILE | cut -d' '  -f2-`
+	if [ -z "$kdump_path" ]; then
+		coredir="/var/crash/127.0.0.1-`date +"%Y-%m-%d-%H:%M"`"
+	else
+		coredir="${kdump_path}/127.0.0.1-`date +"%Y-%m-%d-%H:%M"`"
+	fi
+
+	mkdir -p $coredir
+	save_kernel_logs "${coredir}"
+	/usr/sbin/makedumpfile -c --message-level 1 -d 31 /proc/vmcore $coredir/vmcore-incomplete
+	if [ $? == 0 ]; then
+		mv $coredir/vmcore-incomplete $coredir/vmcore
+		$LOGGER "saved a vmcore to $coredir"
+	else
+		$LOGGER "failed to save a vmcore to $coredir"
+	fi
+}
+
+function check_config()
+{
+	local modified_files=""
+	local force_rebuild=0
+	if [ -f /etc/kdump-adv-conf/initramfs.conf ]
+	then
+		$LOGGER "Using Kdump advanced configuration service"
+		if [ -n "$DRACUT_CMD" ]
+		then
+			MKDUMPRD=$DRACUT_CMD
+		else
+			MKDUMPRD="dracut -f -c /etc/kdump-adv-conf/initramfs.conf"
+		fi
+		# We always rebuild here, since it takes longer
+		# to figure out if anything has changed
+		touch /etc/kdump.conf
+	else
+		MKDUMPRD="/sbin/mkdumprd -d -f $MKDUMPRD_ARGS"
+	fi
+
+	force_rebuild=`grep ^force_rebuild $KDUMP_CONFIG_FILE | cut -d' '  -f2`
+	if [ -n "$force_rebuild" ] && [ "$force_rebuild" -ne 0 ]
+	then
+                modified_files="force_rebuild"
+	fi
+
+	if [ -z "$KDUMP_KERNELVER" ]; then
+		local running_kernel=`uname -r`
+
+		kdump_kver=`echo $running_kernel | sed 's/smp//g'`
+	else
+		kdump_kver=$KDUMP_KERNELVER
+	fi
+
+	kdump_kernel="${KDUMP_BOOTDIR}/${KDUMP_IMG}-${kdump_kver}${KDUMP_IMG_EXT}"
+	kdump_initrd="${KDUMP_BOOTDIR}/initrd-${kdump_kver}kdump.img"
+
+	if [ ! -f $kdump_kernel ]; then
+		echo -n "No kdump kernel image found."; warning; echo
+		echo "Tried to locate ${kdump_kernel}"
+		return 0
+	fi
+
+	if [ ! -f $kdump_initrd ]; then
+		echo  -n "No kdump initial ramdisk found."; warning; echo
+		if ! check_xen_hvm_nopv_premkdumprd; then
+			echo "hvm guest with pv drivers is not supported."
+			exit 1
+		fi
+
+		echo "Rebuilding $kdump_initrd"
+		$MKDUMPRD $kdump_initrd $kdump_kver
+		if [ $? != 0 ]; then
+			echo "Failed to run mkdumprd"
+			$LOGGER "mkdumprd: failed to make kdump initrd"
+			exit 1
+		fi
+		return 0
+	fi
+
+	if [ -z "$modified_files" ]
+	then
+		#check to see if config file or kdump post has been modified
+		#since last build of the image file
+		image_time=`stat -c "%Y" $kdump_initrd`
+		EXTRA_FILES=`grep ^kdump_post $KDUMP_CONFIG_FILE | cut -d\  -f2`
+		CHECK_FILE=`grep ^kdump_pre $KDUMP_CONFIG_FILE | cut -d\  -f2`
+		EXTRA_FILES="$EXTRA_FILES $CHECK_FILE"
+		CHECK_FILE=`grep ^extra_modules $KDUMP_CONFIG_FILE | cut -d\  -f2-`
+		EXTRA_FILES="$EXTRA_FILES $CHECK_FILE"
+		CHECK_FILE=`grep ^extra_bins $KDUMP_CONFIG_FILE | cut -d\  -f2-`
+		EXTRA_FILES="$EXTRA_FILES $CHECK_FILE"
+		FORCE_REBUILD=`grep ^extra_modules $KDUMP_CONFIG_FILE`
+		files="$KDUMP_CONFIG_FILE $kdump_kernel $EXTRA_FILES"
+
+		#check to see if cluster is configured to use fence_kdump
+		if [ -f "$CLUSTER_CONFIG_FILE" ] && grep -q fence_kdump "$CLUSTER_CONFIG_FILE"
+		then
+		    files="$files $CLUSTER_CONFIG_FILE"
+		    if [ -f "$FENCE_KDUMP_CONFIG" ]; then
+			files="$files $FENCE_KDUMP_CONFIG"
+		    fi
+		fi
+
+		for file in $files; do
+			time_stamp=0
+			if [ -f "$file" ]; then
+				time_stamp=`stat -c "%Y" $file`
+			else
+				modified_files="$modified_files $file"
+				continue
+			fi
+			if [ "$time_stamp" -gt "$image_time" ]; then
+				modified_files="$modified_files $file"
+			fi
+		done
+	fi
+
+        if [ -n "$FORCE_REBUILD" -a "$modified_files"!=" " ]
+        then
+                modified_files="force_rebuild"
+        fi
+
+        if [ -n "$modified_files" -a "$modified_files"!=" " ]; then
+                if [ "$modified_files" != "force_rebuild" ]
+                then
+                        echo "Detected change(s) the following file(s):"
+                        echo -n "  "; echo "$modified_files" | sed 's/\s/\n  /g'
+                fi
+
+		if ! check_xen_hvm_nopv_premkdumprd; then
+			echo "hvm guest with pv drivers is not supported."
+			exit 1
+		fi
+
+                echo "Rebuilding $kdump_initrd"
+		$MKDUMPRD $kdump_initrd $kdump_kver
+                if [ $? != 0 ]; then
+                        echo "Failed to run mkdumprd"
+                        $LOGGER "mkdumprd: failed to make kdump initrd"
+                        return 1
+                fi
+        fi
+
+	#double check the xen_*front modules are not included for xen hvm
+	if in_xen_hvm_guest; then
+		if $(lsinitrd $kdump_initrd|grep -q "xen_.*front.ko"); then
+			echo "Found xen pv drivers in kdump initrd"
+			exit 1
+		fi
+	fi
+        return 0
+}
+
+# This function check iomem and determines if we have more than
+# 4GB of ram available. Returns 1 if we do, 0 if we dont
+function need_64bit_headers()
+{
+    return `tail -n 1 /proc/iomem | awk '{ split ($1, r, "-"); \
+    print (strtonum("0x" r[2]) > strtonum("0xffffffff")); }'`
+}
+
+function avoid_cdrom_drive()
+{
+	local DRIVE=""
+	local MEDIA=""
+	local IDE_DRIVES=(`echo hd{a,b,c,d}`)
+	local COUNTER="0"
+
+	for DRIVE in ${IDE_DRIVES[@]}
+	do
+		if ! $(echo "$KDUMP_COMMANDLINE" |grep -q "$DRIVE=");then
+			if [ -f /proc/ide/$DRIVE/media ];then
+				MEDIA=$(cat /proc/ide/$DRIVE/media)
+				if [ x"$MEDIA" == x"cdrom" ]; then
+					KDUMP_IDE_NOPROBE_COMMANDLINE="$KDUMP_IDE_NOPROBE_COMMANDLINE $DRIVE=cdrom"
+					COUNTER=$(($COUNTER+1))
+				fi
+			fi
+		else
+			KDUMP_IDE_NOPROBE_COMMANDLINE="$KDUMP_IDE_NOPROBE_COMMANDLINE $DRIVE=noprobe"
+		fi
+	done
+	# We don't find cdrom drive.
+	if [ $COUNTER -eq 0 ]; then
+		KDUMP_IDE_NOPROBE_COMMANDLINE=""
+	fi
+}
+
+function check_kernel_parameter()
+{
+	if [ -z "$KDUMP_COMMANDLINE" ]
+	then
+		KDUMP_COMMANDLINE=`cat /proc/cmdline`
+	fi
+
+	MEM_RESERVED=`cat /sys/kernel/kexec_crash_size`
+
+	if [ $MEM_RESERVED -eq 0 ]
+	then
+		return 1
+	else
+		return 0
+	fi
+}
+
+# Load the kdump kerel specified in /etc/sysconfig/kdump
+# If none is specified, try to load a kdump kernel with the same version
+# as the currently running kernel.
+function load_kdump()
+{
+	ARCH=`uname -m`
+
+	# Get the approx amount of ram the kernel is using in Kb
+	KMEMINUSE=`awk '/Slab:.*/ {print $2}' /proc/meminfo`
+	# Convert the reserved ram amount to Kb
+	MEM_RESERVED=`dc -e"$MEM_RESERVED 1024 / p"`
+
+	# Take 70% of the reserved value rounding up to the nearest integer
+	MEM_RESERVED=`dc -e"$MEM_RESERVED .7 * 10 * 10 / p"`
+
+	#On x86, we are using nr_cpus=1, so the following check is not necessary.
+	if [ "$ARCH" != "i686" -a "$ARCH" != "i386" -a "$ARCH" != "x86_64" ]
+	then
+		#Check if the KMEMINUSE is greater than MEM_RESERVED
+		# This indicates that the currently runnign kernel is using
+		# 70% of the amount of memory that we have reserved for kdump
+		# we should issue a warning here indicating that the user may
+		# want to increase the amount of reserved ram on the system
+		if [ $KMEMINUSE -gt $MEM_RESERVED ]
+		then
+			echo -n "Your running kernel is using more than 70% of the amount of space you reserved for kdump, you should consider increasing your crashkernel reservation"
+			warning
+			echo
+		fi 
+	fi
+
+	if [ "$ARCH" == "i686" -o "$ARCH" == "i386" ]
+	then
+
+		need_64bit_headers
+		if [ $? == 1 ]
+		then
+			FOUND_ELF_ARGS=`echo $KEXEC_ARGS | grep elf32-core-headers`
+			if [ -n "$FOUND_ELF_ARGS" ]
+			then
+				echo -n "Warning: elf32-core-headers overrides correct elf64 setting"
+				warning
+				echo
+			else	
+				KEXEC_ARGS="$KEXEC_ARGS --elf64-core-headers"
+			fi
+		else
+			FOUND_ELF_ARGS=`echo $KEXEC_ARGS | grep elf64-core-headers`
+			if [ -z "$FOUND_ELF_ARGS" ]
+			then
+				KEXEC_ARGS="$KEXEC_ARGS --elf32-core-headers"
+			fi
+		fi
+	fi
+
+	if [ -f /sys/firmware/efi/systab ]
+	then
+		if grep -q '^ACPI20=' /sys/firmware/efi/systab
+		then
+			acpi_addr=$(awk -F'=' '/^ACPI20=/ {print $2}' /sys/firmware/efi/systab)
+		else
+			acpi_addr=$(awk -F'=' '/^ACPI=/ {print $2}' /sys/firmware/efi/systab)
+		fi
+		KDUMP_COMMANDLINE="$KDUMP_COMMANDLINE noefi acpi_rsdp=$acpi_addr"
+	fi
+
+	if echo "$KDUMP_COMMANDLINE_APPEND" | grep -q nr_cpus;
+	then
+		ver=`uname -r`
+		maj=`echo $ver | cut -d'-' -f1`
+		min=`echo $ver | cut -d'-' -f2`
+		min=${min%%.*}
+		if [ "$maj" = "2.6.32" ] && [ $min -lt 171 ]
+		then
+			echo "Your kernel is old, please use maxcpus=1 instead of nr_cpus=1"
+			return 1
+		fi
+	fi
+	KDUMP_COMMANDLINE=`remove_cmdline_param "$KDUMP_COMMANDLINE" crashkernel mem hugepages hugepagesz`
+	KDUMP_COMMANDLINE="${KDUMP_COMMANDLINE} ${KDUMP_COMMANDLINE_APPEND}"
+	avoid_cdrom_drive
+	KDUMP_COMMANDLINE="${KDUMP_COMMANDLINE} ${KDUMP_IDE_NOPROBE_COMMANDLINE}"
+
+	if ! grep -q /sys/kernel/debug /proc/mounts;
+	then
+		mount -t debugfs debug /sys/kernel/debug
+		MNTDEBUG=/sys/kernel/debug
+	fi
+	
+	$KEXEC $KEXEC_ARGS $standard_kexec_args \
+		--command-line="$KDUMP_COMMANDLINE" \
+		--initrd=$kdump_initrd $kdump_kernel 2>/dev/null
+	if [ $? == 0 ]; then
+		umount $MNTDEBUG 2>/dev/null
+		$LOGGER "kexec: loaded kdump kernel"
+		return 0
+	else
+		umount $MNTDEBUG 2>/dev/null
+		$LOGGER "kexec: failed to load kdump kernel"
+		return 1
+	fi
+}
+
+function propagate_ssh_key()
+{
+	while read config_opt config_val; do
+		case "$config_opt" in
+		sshkey)
+			SSH_KEY_LOCATION="$config_val"
+			;;
+		*)
+			;;
+		esac 
+	done < $KDUMP_CONFIG_FILE
+
+	local KEYFILE=$SSH_KEY_LOCATION
+	local errmsg="Failed to propagate ssh key"
+
+	#make sure they've configured kdump.conf for ssh dumps
+	local SSH_TARGET=`awk '/^\ *net.*@.*$/ {print $0}' $KDUMP_CONFIG_FILE`
+	[ -z "$SSH_TARGET" ] && SSH_TARGET=`awk '/^\ *ssh.*@.*$/ {print $0}' $KDUMP_CONFIG_FILE`
+	if [ -z "$SSH_TARGET" ]; then
+		echo "No ssh config specified in $KDUMP_CONFIG_FILE.  Can't propagate"
+		$LOGGER "$errmsg, no ssh config specified in $KDUMP_CONFIG_FILE"
+		exit 1
+	fi
+
+	#Check to see if we already created key, if not, create it.
+	if [ -f $KEYFILE ]; then
+		echo "Using existing keys..."
+	else
+		echo -n "Generating new ssh keys... "
+		/usr/bin/ssh-keygen -t rsa -f $KEYFILE -N "" 2>&1 > /dev/null
+		echo "done."
+	fi
+
+	#now find the target ssh user and server to contact.
+	SSH_USER=`echo $SSH_TARGET | cut -d\  -f2 | cut -d@ -f1`
+	SSH_SERVER=`echo $SSH_TARGET | sed -e's/\(.*@\)\(.*$\)/\2/'`
+ 
+	#now send the found key to the found server
+	ssh-copy-id -i $KEYFILE $SSH_USER@$SSH_SERVER &>/dev/null
+	RET=$?
+	if [ $RET == 0 ]; then
+		echo $KEYFILE has been added to ~$SSH_USER/.ssh/authorized_keys on $SSH_SERVER
+		$LOGGER "propagated ssh key (ssh server: $SSH_SERVER)"
+		return 0
+	else
+		echo $KEYFILE failed in transfer to $SSH_SERVER
+		$LOGGER "$errmsg, unable to transfer $KEYFILE to $SSH_SERVER"
+		exit 1
+	fi
+		
+}
+
+function status()
+{
+	if [ ! -e /sys/kernel/kexec_crash_loaded ]
+	then
+		return 2 
+	fi
+
+	if in_xen_pv_guest; then
+		return 2
+	elif in_xen_hvm_guest && ! grep -q -e xen_emul_unplug=never -e xen_emul_unplug=unnecessary /proc/cmdline; then
+		echo 'kdump only supported on xen hvm guests booted with xen_emul_unplug=never or xen_emul_unplug=unnecessary'
+		return 2
+	fi
+
+	rc=`cat /sys/kernel/kexec_crash_loaded`
+	if [ $rc == 1 ]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+function save_raw()
+{
+	local raw_part=$(awk '$1 ~ /^raw$/ { print $2; }' $KDUMP_CONFIG_FILE)
+	local kdump_dir
+	if [ "$raw_part" ]; then
+		[ -b "$raw_part" ] || {
+			echo "raw partition $raw_part not found"
+			return 1
+		}
+		kdump_dir=`grep ^path $KDUMP_CONFIG_FILE | cut -d' '  -f2-`
+		if [ -z "${kdump_dir}" ]; then
+			coredir="/var/crash/`date +"%Y-%m-%d-%H:%M"`"
+		else
+			coredir="${kdump_dir}/`date +"%Y-%m-%d-%H:%M"`"
+		fi
+		mkdir -p "$coredir"
+		[ -d "$coredir" ] || {
+			echo "failed to create $coredir"
+			return 1
+		}
+		if makedumpfile -R $coredir/vmcore <$raw_part >/dev/null 2>&1; then
+			# dump found
+			echo "Dump saved to $coredir/vmcore"
+			# wipe makedumpfile header
+			dd if=/dev/zero of=$raw_part bs=1b count=1 2>/dev/null
+		else
+			rm -rf "$coredir"
+		fi
+	fi
+	return 0
+}
+
+get_save_path() {
+	local _save_path=$(grep "^path" /etc/kdump.conf|awk '{print $2}')
+	if [ -z "$_save_path" ]; then
+		_save_path="/var/crash"
+	fi
+
+	echo $_save_path
+}
+
+is_dump_target_configured() {
+    local _target
+
+    _target=$(egrep "^ext[234]|^xfs|^btrfs|^minix|^raw|^ssh|^nfs|^nfs4|^net" /etc/kdump.conf)
+
+     [ -n "$_target" ]
+}
+
+local_fs_dump_target()
+{
+	local _target
+
+	_target=$(egrep "^ext[234]|^xfs|^btrfs|^minix" /etc/kdump.conf)
+	if [ $? -eq 0 ]; then
+		echo $_target|awk '{print $2}'
+	fi
+}
+
+path_to_be_relabeled() {
+	local _path _target _mnt="/" _rmnt
+
+	if is_dump_target_configured; then
+		_target=$(local_fs_dump_target)
+		if [[ -n "$_target" ]]; then
+			_mnt=$(findmnt -k -f -n -r -o TARGET $_target)
+			if [ -z "$_mnt" ]; then
+				return
+			fi
+		else
+			return
+		fi
+	fi
+
+	_path=$(get_save_path)
+	# if $_path is masked by other mount, we will not relabel it.
+	# one exception is ! is_dump_target_configure && "$_rmnt" != "$_mnt"
+	# for this exception see mkdumprd code about [ -z "$USING_METHOD" ]
+	_rmnt=$(df $_mnt/$_path 2>/dev/null | tail -1 | awk '{ print $NF }')
+	if [[ "$_rmnt" == "$_mnt" ]] || ! is_dump_target_configured; then
+		echo $_mnt/$_path
+	fi
+}
+
+selinux_relabel()
+{
+	local _path _i _attr
+
+	_path=$(path_to_be_relabeled)
+	if [ -z "$_path" ] || ! [ -d "$_path" ] ; then
+		return
+	fi
+
+	for _i in $(find $_path); do
+		_attr=$(getfattr -m "security.selinux" $_i 2>/dev/null)
+		if [ -z "$_attr" ]; then
+			restorecon $_i;
+		fi
+	done
+}
+
+
+# Notes about xen support:
+# pv guests are not supported
+# hvm guests are supported only when you ensure below items:
+# 1. Boot guests with either xen_emul_unplug=never or
+#    xen_emul_unplug=unnecessary.
+# 2. While recreating kdump initrd xen_netfront and xen_blkfront modules
+#    are not loaded
+function start()
+{
+	if sestatus 2>/dev/null | grep -q "SELinux status.*enabled"; then
+		selinux_relabel
+	fi
+	save_raw
+	if [ $? -ne 0 ]; then
+		echo -n "Starting kdump:"; failure; echo
+		$LOGGER "failed to start up"
+		return 1
+	fi
+	status 
+	rc=$?
+	if [ $rc == 2 ]; then
+		echo -n "Kdump is not supported on this kernel"; failure; echo
+		return 1;
+	else
+		if [ $rc == 0 ]; then
+			echo -n "Kdump already running"; success; echo
+			return 0
+		fi
+	fi
+
+	check_kernel_parameter
+	if [ $? != 0 ]; then
+		echo -n "Starting kdump:"; failure; echo
+		$LOGGER "No crashkernel parameter specified for running kernel"
+		return 1
+	fi
+
+	check_config
+	if [ $? != 0 ]; then
+		echo -n "Starting kdump:"; failure; echo
+		$LOGGER "failed to start up, config file incorrect"
+		return 1
+	fi
+	load_kdump
+	if [ $? != 0 ]; then
+		echo -n "Starting kdump:"; failure; echo
+		$LOGGER "failed to start up"
+		return 1
+	fi
+
+	echo -n "Starting kdump:"; success; echo
+	$LOGGER "started up"
+}
+
+function stop()
+{
+	$KEXEC -p -u 2>/dev/null
+	if [ $? == 0 ]; then
+		$LOGGER "kexec: unloaded kdump kernel"
+		echo -n "Stopping kdump:"; success; echo
+		$LOGGER "stopped"
+		return 0
+	else
+		$LOGGER "kexec: failed to unload kdump kernel"
+		echo -n "Stopping kdump:"; failure; echo
+		$LOGGER "failed to stop"
+		return 1
+	fi
+}
+
+# Other kdump init instances will block in queue, until this one exits.
+single_instance_lock
+
+case "$1" in
+  start)
+	if [ -s /proc/vmcore ]; then
+		save_core
+		reboot
+	else
+		start
+	fi
+	;;
+  stop)
+	stop
+	;;
+  status)
+	EXIT_CODE=0
+	status
+	case "$?" in
+	0)
+		echo "Kdump is operational"
+		EXIT_CODE=0
+		;;
+	1)
+		echo "Kdump is not operational"
+		EXIT_CODE=3
+		;;
+	2)
+		echo "Kdump is unsupported on this kernel"
+		EXIT_CODE=3
+		;;
+	esac
+	exit $EXIT_CODE
+	;;
+  restart)
+	stop
+	start
+	;;
+  condrestart)
+        EXIT_CODE=1
+        status
+        case "$?" in
+        0)
+                stop
+                start
+                EXIT_CODE=0
+        ;;
+        esac
+        exit $EXIT_CODE
+	;;
+  propagate)
+	propagate_ssh_key
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|status|restart|propagate}"
+	exit 1
+esac
+
+exit $?

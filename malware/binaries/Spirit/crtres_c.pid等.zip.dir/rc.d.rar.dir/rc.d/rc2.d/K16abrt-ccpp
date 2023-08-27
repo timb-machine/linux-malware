@@ -1,0 +1,83 @@
+#!/bin/bash
+# Install ABRT coredump hook
+#
+# chkconfig: 35 82 16
+# description: Installs coredump handler which saves segfault data
+### BEGIN INIT INFO
+# Provides: abrt-ccpp
+# Required-Start: $abrtd
+# Default-Stop: 0 1 2 6
+# Default-Start: 3 5
+# Short-Description: Installs coredump handler which saves segfault data
+# Description: Installs coredump handler which saves segfault data
+### END INIT INFO
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+LOCK="/var/lock/subsys/abrt-ccpp"
+INSTALL_HOOK="/usr/sbin/abrt-install-ccpp-hook"
+
+RETVAL=0
+
+check() {
+	# Check that we're a privileged user
+	[ "`id -u`" = 0 ] || exit 4
+}
+
+start() {
+	check
+
+	$INSTALL_HOOK install
+	RETVAL=$?
+	[ $RETVAL -eq 0 ] && touch -- "$LOCK"
+	return $RETVAL
+}
+
+stop() {
+	check
+
+	$INSTALL_HOOK uninstall
+	RETVAL=$?
+	[ $RETVAL -eq 0 ] && rm -f -- "$LOCK"
+	return $RETVAL
+}
+
+restart() {
+	stop
+	start
+}
+
+reload() {
+	restart
+}
+
+case "$1" in
+start)
+	start
+	;;
+stop)
+	stop
+	;;
+reload)
+	reload
+	;;
+force-reload)
+	echo "$0: Unimplemented feature."
+	RETVAL=3
+	;;
+restart)
+	restart
+	;;
+condrestart)
+	$INSTALL_HOOK is-installed && restart
+	;;
+status)
+	$INSTALL_HOOK is-installed && RETVAL=0 || RETVAL=3
+	;;
+*)
+	echo $"Usage: $0 {start|stop|status|restart|condrestart|reload|force-reload}"
+	RETVAL=2
+esac
+
+exit $RETVAL

@@ -1,0 +1,146 @@
+#!/bin/sh
+#
+# "$Id: cups.sh,v 1.10 2000/03/30 05:19:16 mike Exp $"
+#
+#   Startup/shutdown script for the Common UNIX Printing System (CUPS).
+#
+#   Linux chkconfig stuff:
+#
+#   chkconfig: 2345 25 10
+#   description: Startup/shutdown script for the Common UNIX \
+#                Printing System (CUPS).
+#
+#   Copyright 1997-2000 by Easy Software Products, all rights reserved.
+#
+#   These coded instructions, statements, and computer programs are the
+#   property of Easy Software Products and are protected by Federal
+#   copyright law.  Distribution and use rights are outlined in the file
+#   "LICENSE.txt" which should have been included with this file.  If this
+#   file is missing or damaged please contact Easy Software Products
+#   at:
+#
+#       Attn: CUPS Licensing Information
+#       Easy Software Products
+#       44141 Airport View Drive, Suite 204
+#       Hollywood, Maryland 20636-3111 USA
+#
+#       Voice: (301) 373-9603
+#       EMail: cups-info@cups.org
+#         WWW: http://www.cups.org
+#
+# heavily edited so that it's more like other scripts in init.d on Red Hat
+# Linux
+#
+### BEGIN INIT INFO
+# Provides: cups
+# Required-Start: $syslog $local_fs
+# Required-Stop: $syslog $local_fs
+# Should-Start: portreserve
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: The CUPS scheduler
+# Description: The CUPS scheduler
+### END INIT INFO
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+[ -f /etc/sysconfig/cups ] && . /etc/sysconfig/cups
+
+DAEMON=cupsd
+exec=/usr/sbin/cupsd
+prog=cups
+config=/etc/cups/cupsd.conf
+lockfile=/var/lock/subsys/cups
+
+check() {
+	# Check that we're a privileged user
+	[ `id -u` = 0 ] || exit 4
+	
+	# Check if cupsd is executable
+	[ -x $exec ] || exit 5
+}
+
+start () {
+	check
+	[ -f $config ] || exit 6
+
+	echo -n $"Starting $prog: "
+
+	# tell portreserve to release the port
+	[ -x /sbin/portrelease ] && /sbin/portrelease cups &>/dev/null || :
+
+	# start daemon
+	daemon $DAEMON
+        RETVAL=$?
+	echo
+	[ $RETVAL = 0 ] && touch $lockfile
+
+	udevadm trigger --subsystem-match=usb	\
+		--attr-match=bInterfaceClass=07	\
+		--attr-match=bInterfaceSubClass=01 &>/dev/null || :
+        udevadm trigger --subsystem-match=usb \
+		--property-match=DEVNAME="/dev/usb/lp*" &>/dev/null || :
+
+	return 0
+}
+
+stop () {
+	check
+
+	# stop daemon
+	echo -n $"Stopping $prog: "
+	killproc $DAEMON
+	RETVAL=$?
+	echo
+	[ $RETVAL = 0 ] && rm -f $lockfile
+	return 0
+}
+
+restart() {
+	stop
+	start
+}
+
+case $1 in
+	start)
+		start
+	;;
+	stop)
+		stop
+	;;
+	restart)
+		restart
+	;;
+	condrestart|try-restart)
+		[ -f $lockfile ] && restart || :
+	;;	
+	reload)
+		echo -n $"Reloading $prog: "
+		killproc $DAEMON -HUP
+		RETVAL=$?
+		echo
+	;;
+	force-reload)
+		echo -n $"Reloading $prog: "
+		if ! killproc $DAEMON -HUP; then
+			restart
+		fi
+		echo
+	;;
+	status)
+		status -l $(basename $lockfile) $DAEMON
+		RETVAL=$?
+	;;
+	restartlog)
+		stop
+		cat /dev/null >/var/log/cups/error_log
+		start
+	;;
+	*)
+
+	echo $"Usage: $prog {start|stop|restart|restartlog|condrestart|try-restart|reload|force-reload|status}" 
+	exit 2
+esac
+
+exit $RETVAL

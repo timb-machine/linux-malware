@@ -1,0 +1,106 @@
+#!/bin/bash
+#
+# rpcidmapd     Start up and shut down RPC name to UID/GID mapper
+#
+# chkconfig: 345 18 85
+# description: Starts user-level daemon for NFSv4 that maps user \
+#              names to UID and GID numbers.
+
+### BEGIN INIT INFO
+# Provides: rpcidmapd
+# Required-Start: $network $syslog
+# Required-Stop: $network $syslog
+# Default-Start: 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: Starts the NFSv4 id mapping daemon
+# Description: NFS is a popular protocol for file sharing across \
+#          networks. This deamon maps user names and groups to UID \
+#          and GID numbers on NFSv4 mounts.
+### END INIT INFO
+
+# Source function library.
+. /etc/init.d/functions
+
+# Source networking configuration.
+[ -f /etc/sysconfig/network ] &&  . /etc/sysconfig/network
+
+# Check for and source configuration file otherwise set defaults
+[ -f /etc/sysconfig/nfs ] && . /etc/sysconfig/nfs
+
+RETVAL=0
+prog="rpc.idmapd"
+LOCKFILE=/var/lock/subsys/$prog
+uid=`id | cut -d\( -f1 | cut -d= -f2`
+
+case "$1" in
+  start|condstart)
+	# Check that networking is up.
+	[ "${NETWORKING}" != "yes" ] && exit 6
+	
+	[ ! -x /usr/sbin/rpc.idmapd ] && exit 5
+
+	# Only root can start the service
+	[ $uid -ne 0 ] && exit 4
+
+	# Make sure the daemon is not already running.
+	[ "$1" = "condstart" -a -n "`pidofproc $prog`" ] && {
+		killproc $prog "-SIGHUP" > /dev/null
+		exit 0
+	}
+	[ "$1" = "start" ] && {
+		if status $prog > /dev/null ; then
+			exit 0
+		fi
+	}
+	rm -f $LOCKFILE
+
+	echo -n $"Starting RPC idmapd: "
+
+	# Make sure the rpc_pipefs filesystem is available
+	/bin/mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs > /dev/null 2>&1
+
+	# Start daemon.
+	daemon $prog ${RPCIDMAPDARGS}
+	RETVAL=$?
+	echo
+	[ $RETVAL -eq 0 ] && touch $LOCKFILE
+	;;
+  stop)
+	# Only root can stop the service
+	[ $uid -ne 0 ] && exit 4
+
+	# Stop daemon.
+	echo -n $"Shutting down RPC idmapd: "
+	killproc $prog
+	RETVAL=$?
+	echo
+	rm -f $LOCKFILE
+	;;
+  status)
+	status rpc.idmapd
+	RETVAL=$?
+	;;
+  restart|reload|force-reload)
+	$0 stop
+	$0 start
+	RETVAL=$?
+	;;
+  condrestart|try-restart)
+	if [ -f $LOCKFILE ]; then
+		$0 restart
+		RETVAL=$?
+	fi
+	;;
+  condstop)
+	if [ -f $LOCKFILE ]; then
+		$0 stop
+		RETVAL=$?
+	fi
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|restart|force-reload|condstart|condrestart|try-restart|status|condstop}"
+	RETVAL=2
+	;;
+esac
+
+exit $RETVAL

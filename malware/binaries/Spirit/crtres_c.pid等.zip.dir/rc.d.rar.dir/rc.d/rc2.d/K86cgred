@@ -1,0 +1,169 @@
+#!/bin/bash
+#
+# Start/Stop the CGroups Rules Engine Daemon
+#
+# Copyright Red Hat Inc. 2008
+#
+# Authors:	Steve Olivieri <sjo@redhat.com>
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of version 2.1 of the GNU Lesser General Public License
+# as published by the Free Software Foundation.
+# 
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# cgred		CGroups Rules Engine Daemon
+# chkconfig:	- 30 86
+# description:	This is a daemon for automatically classifying processes \
+#		into cgroups based on UID/GID.
+#
+# processname: cgrulesengd
+# pidfile: /var/run/cgred.pid
+#
+### BEGIN INIT INFO
+# Provides:		cgrulesengd
+# Required-Start:	$local_fs $syslog $cgconfig
+# Required-Stop:	$local_fs $syslog
+# Should-Start:		
+# Should-Stop:		
+# Short-Description:	start and stop the cgroups rules engine daemon
+# Description:		CGroup Rules Engine is a tool for automatically using \
+#			cgroups to classify processes
+### END INIT INFO
+
+prefix=/usr;exec_prefix=/usr;sbindir=/sbin
+CGRED_BIN=$sbindir/cgrulesengd
+CGRED_CONF=/etc/cgrules.conf
+
+# Sanity checks
+[ -x $CGRED_BIN ] || exit 1
+
+# Source function library & LSB routines
+. /etc/rc.d/init.d/functions
+log_success_msg () {
+    echo -n $*; success "$*"; echo
+}
+log_failure_msg () {
+    echo -n $*; failure "$*"; echo
+}
+log_warning_msg () {
+    echo -n $*; warning "$*"; echo
+}
+
+# Read in configuration options.
+if [ -f "/etc/sysconfig/cgred.conf" ] ; then
+	. /etc/sysconfig/cgred.conf
+	OPTIONS="$NODAEMON $LOG"
+	if [ -n "$LOG_FILE" ]; then
+		OPTIONS="$OPTIONS --logfile=$LOG_FILE"
+	fi
+	if [ -n "$SOCKET_USER" ]; then
+		OPTIONS="$OPTIONS -u $SOCKET_USER"
+	fi
+	if [ -n "$SOCKET_GROUP" ]; then
+		OPTIONS="$OPTIONS -g $SOCKET_GROUP"
+	fi
+else
+	OPTIONS=""
+fi
+
+# For convenience
+processname=cgrulesengd
+servicename=cgred
+lockfile="/var/lock/subsys/$servicename"
+pidfile=/var/run/cgred.pid
+
+start()
+{
+	echo -n $"Starting CGroup Rules Engine Daemon: "
+	if [ -f "$lockfile" ]; then
+		log_failure_msg "$servicename is already running with PID `cat ${pidfile}`"
+		return 0
+	fi
+	if ! grep "^cgroup" /proc/mounts &>/dev/null; then
+		echo
+		log_failure_msg $"Cannot find cgroups, is cgconfig service running?"
+		return 1
+	fi
+	daemon --check $servicename --pidfile $pidfile $CGRED_BIN $OPTIONS
+	retval=$?
+	echo
+	if [ $retval -ne 0 ]; then
+		return 7
+	fi
+	touch "$lockfile"
+	if [ $? -ne 0 ]; then
+		return 1
+	fi
+	echo "`pidof $processname`" > $pidfile
+	[[ -x /sbin/restorecon ]] && /sbin/restorecon $pidfile
+	return 0
+}
+
+stop()
+{
+	echo -n $"Stopping CGroup Rules Engine Daemon..."
+	if [ ! -f $pidfile ]; then
+		log_success_msg
+		return 0
+	fi
+	killproc -p $pidfile -TERM "$processname"
+	retval=$?
+	echo
+	if [ $retval -ne 0 ]; then
+		return 1
+	fi
+	rm -f "$lockfile" "$pidfile"
+	return 0
+}
+
+RETVAL=0
+
+# See how we are called
+case "$1" in
+	start)
+		start
+		RETVAL=$?
+		;;
+	stop)
+		stop
+		RETVAL=$?
+		;;
+	status)
+		status -p $pidfile $servicename
+		RETVAL=$?
+		;;
+	restart)
+		stop
+		start
+		RETVAL=$?
+		;;
+	condrestart)
+		if [ -f "$lockfile" ]; then
+			stop
+			start
+			RETVAL=$?
+		fi
+		;;
+	reload|flash)
+		if [ -f "$lockfile" ]; then
+			echo $"Reloading rules configuration..."
+			kill -s 12 `cat ${pidfile}`
+			RETVAL=$?
+			if [ $RETVAL -eq 0 ] ; then
+				log_success_msg
+			else
+				log_failure_msg
+			fi
+		else
+			log_failure_msg "$servicename is not running."
+		fi
+		;;
+	*)
+		echo $"Usage: $0 {start|stop|status|restart|condrestart|reload}"
+		RETVAL=2
+		;;
+esac
+
+exit $RETVAL

@@ -1,0 +1,98 @@
+#!/bin/sh
+# 
+# Startup script for mcelog
+# 
+# This should be customized for distribution standards
+# (using rc_status etc.)
+# The paths are hardcoded and are not automatically adjusted
+# for different prefix
+#
+### BEGIN INIT INFO
+# Provides:		mcelog 
+# Default-Start:	3 5
+# Default-Stop:		0 1 2 6
+# Short-Description:	mcelog hardware error logging
+# Description:          Start the mcelog hardware error logging. 
+#                       This logs and handles CPU hardware errors on x86 systems.
+### END INIT INFO
+# pull in sysconfig settings
+[ -f /etc/sysconfig/mcelogd ] && . /etc/sysconfig/mcelogd
+
+# Source function library.
+. /etc/init.d/functions
+
+# private settings
+MCELOG=${MCELOG:-/usr/sbin/mcelog}
+TRIGGER=/sys/devices/system/machinecheck/machinecheck0/trigger
+LOCKFILE="/var/lock/subsys/mcelogd"
+[ ! -x $MCELOG ] && ( echo "mcelog not found" ; exit 1 )
+[ ! -r /dev/mcelog ] && ( echo "/dev/mcelog not active" ; exit 0 )
+
+case "$MCELOG_MODE" in
+daemon)
+	;;
+trigger)
+	;;
+cron)
+	echo "mcelog not started"
+	exit 0
+	;;
+*)
+	echo "Unknown mcelog mode $MCELOG_MODE. Valid daemon/trigger/cron"
+	exit 1
+esac
+
+case "$1" in
+start)
+	if [ -f $LOCKFILE ]; then
+		exit 0
+	fi
+
+	if [ "$MCELOG_MODE" = "daemon" ] ; then
+		echo "Starting mcelog daemon"
+		daemon $MCELOG --daemon $MCELOG_OPTIONS
+		touch $LOCKFILE
+	elif [ -f "$TRIGGER" ] ; then
+		echo $MCELOG > "$TRIGGER"
+		touch $LOCKFILE
+	else
+		echo No machine check capability
+	fi
+	;;
+stop)
+	if [ "$MCELOG_MODE" = "daemon" ] ; then
+		echo "Stopping mcelog"
+		killproc $MCELOG -TERM
+		rm -f $LOCKFILE
+	elif [ "$MCELOG_MODE" = "trigger" -a -f "$TRIGGER" ]; then 
+		echo "" > "$TRIGGER"
+		rm -f $LOCKFILE
+	else
+		echo mcelog not running
+	fi
+	;;
+try-restart)
+	$0 status > /dev/null && $0 restart
+	;;
+restart)
+	$0 stop
+	$0 start
+	;;
+reload)
+	$0 try-restart
+	;;
+force-reload)
+	$0 try-restart
+	;;
+status)
+	if [ "$MCELOG_MODE" = "daemon" ] ; then
+		echo "Checking for mcelog"
+		status $MCELOG
+	fi
+	;;
+*)
+	echo "Usage: $0 {start|stop|try-restart|restart|status|force-reload|reload}"
+	exit 1
+esac
+
+

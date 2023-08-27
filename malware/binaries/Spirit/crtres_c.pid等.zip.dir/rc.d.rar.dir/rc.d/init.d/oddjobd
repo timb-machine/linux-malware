@@ -1,0 +1,106 @@
+#!/bin/bash
+#
+# oddjobd       This shell script takes care of starting and stopping
+#               oddjobd.
+#
+# chkconfig: - 98 02
+# description: oddjobd provides support for unprivileged applications which \
+#	       require one of a set of specified privileged operations to be \
+#	       performed on their behalf.
+#
+### BEGIN INIT INFO
+# Provides: oddjobd
+# Required-Start: $localfs $remotefs messagebus
+# Required-Stop: $localfs $remotefs messagebus
+# Short-Description: start and stop oddjob services
+# Description: The oddjob service provides support for unprivileged
+#     applications which require one of a set of specified privileged
+#     operations to be performed on their behalf.
+### END INIT INFO
+
+prefix=/usr
+exec_prefix=/usr
+bindir=/usr/bin
+sbindir=/usr/sbin
+sysconfdir=/etc
+prog=oddjobd
+oddjobd=${sbindir}/${prog}
+pidfile=/var/run/${prog}.pid
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+start() {
+	# Start daemons.
+	echo -n $"Starting $prog: "
+	daemon ${oddjobd} -p ${pidfile} -t 300 2>/dev/null
+	RETVAL=$?
+	echo
+	if [ $RETVAL -eq 0 ]; then 
+	    touch /var/lock/subsys/oddjobd
+	    if [ -x /usr/bin/logger ]; then
+		/usr/bin/logger -t oddjobd 'oddjobd startup succeeded'
+	    fi;
+	else
+	    if [ -x /usr/bin/logger ]; then
+		/usr/bin/logger -t oddjobd 'oddjobd startup failed'
+	    fi;
+        fi
+	return $RETVAL
+}
+
+stop() {
+	# Stop daemons.
+	echo -n $"Shutting down $prog: "
+	killproc ${oddjobd}
+	RETVAL=$?
+	echo
+	if [ $RETVAL -eq 0 ]; then
+           rm -f /var/lock/subsys/oddjobd
+	   if [ -x /usr/bin/logger ]; then
+		/usr/bin/logger -t oddjobd 'oddjobd shutdown succeeded'
+	   fi;
+	else
+	   if [ -x /usr/bin/logger ]; then
+		/usr/bin/logger -t oddjobd 'oddjobd shutdown failed'
+	   fi;
+	fi
+	return $RETVAL
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  restart)
+	stop
+	start
+	RETVAL=$?
+	;;
+  reload|force-reload)
+	echo -n $"Reloading $prog configuration: "
+	killproc ${oddjobd} -HUP
+	RETVAL=$?
+	echo
+  	;;
+  condrestart|try-restart)
+	if [ -f /var/lock/subsys/oddjobd ]; then
+	    stop
+	    start
+	    RETVAL=$?
+	fi
+	;;
+  status)
+	status ${oddjobd}
+	RETVAL=$?
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|restart|condrestart|try-restart|reload|force-reload|status}"
+	exit 2
+esac
+
+exit $RETVAL

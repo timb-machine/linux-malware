@@ -1,0 +1,105 @@
+#!/bin/sh
+#
+# haldaemon:   HAL daemon
+#
+# chkconfig: 345 26 74
+# description:  This is a daemon for collecting and maintaing information \
+#               about hardware from several sources. \
+#               See http://www.freedesktop.org/Software/hal
+#
+# processname: hald
+# pidfile: /var/run/haldaemon.pid
+#
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+# so we can rearrange this easily
+processname=hald
+servicename=haldaemon
+
+if [ -f /etc/sysconfig/haldaemon ]; then
+    HALD_ARGS=`cat /etc/sysconfig/haldaemon`
+fi
+RETVAL=0
+
+#
+# See how we were called.
+#
+
+check() {
+	# Check that we're a privileged user
+	[ `id -u` = 0 ] || exit 4
+
+	# Check if hald is executable
+	test -x /usr/sbin/hald || exit 5
+}
+
+start() {
+
+	check
+
+	# Check if it is already running
+	if [ ! -f /var/lock/subsys/$servicename ]; then
+		echo -n $"Starting HAL daemon: "
+		daemon --check $servicename $processname $HALD_ARGS
+		RETVAL=$?
+		[ $RETVAL -eq 0 ] && touch /var/lock/subsys/$servicename
+		echo
+	fi
+	return $RETVAL
+}
+
+stop() {
+
+	check
+
+	echo -n $"Stopping HAL daemon: "
+	killproc $servicename -TERM
+	RETVAL=$?
+    [ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/$servicename
+	echo
+	if [ $RETVAL -eq 0 ]; then
+		rm -f /var/lock/subsys/$servicename
+		rm -f /var/run/haldaemon.pid
+	fi
+	return $RETVAL
+}
+
+case "$1" in
+start)
+	start
+	;;
+stop)
+	stop
+	;;
+reload)
+	echo "$0: Unimplemented feature (hald does this automatically)."
+	RETVAL=3
+	;;
+force-reload)
+	echo "$0: Unimplemented feature."
+	RETVAL=3
+	;;
+status)
+	status -p /var/run/haldaemon.pid -l haldaemon $processname
+	RETVAL=$?
+	;;
+restart)
+	stop
+	sleep 3
+	start
+	;;
+try-restart|condrestart)
+	if [ -f /var/lock/subsys/$servicename ]; then
+		stop
+		sleep 3
+		start
+	fi
+	;;
+*)
+	echo $"Usage: $0 {start|stop|status|restart|condrestart}"
+	RETVAL=2
+esac
+
+exit $RETVAL

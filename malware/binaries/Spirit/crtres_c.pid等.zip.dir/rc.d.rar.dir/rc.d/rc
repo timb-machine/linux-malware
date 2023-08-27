@@ -1,0 +1,104 @@
+#! /bin/bash
+#
+# rc            This file is responsible for starting/stopping
+#               services when the runlevel changes.
+#
+# Original Author:       
+#               Miquel van Smoorenburg, <miquels@drinkel.nl.mugnet.org>
+#
+
+set -m
+
+# check a file to be a correct runlevel script
+check_runlevel ()
+{
+	# Check if the file exists at all.
+	[ -x "$1" ] || return 1
+	is_ignored_file "$1" && return 1
+	return 0
+}
+
+# Now find out what the current and what the previous runlevel are.
+argv1="$1"
+set $(/sbin/runlevel)
+runlevel=$2
+previous=$1
+export runlevel previous
+
+. /etc/init.d/functions
+
+export CONSOLETYPE
+do_confirm="no"
+if [ -f /var/run/confirm ]; then
+	do_confirm="yes"
+fi
+UPSTART=
+[ -x /sbin/initctl ] && UPSTART=yes
+# See if we want to be in user confirmation mode
+if [ "$previous" = "N" ]; then
+	if [ "$do_confirm" = "yes" ]; then
+		echo $"Entering interactive startup"
+	else
+		echo $"Entering non-interactive startup"
+	fi
+fi
+
+# Get first argument. Set new runlevel to this argument.
+[ -n "$argv1" ] && runlevel="$argv1"
+
+# Is there an rc directory for this new runlevel?
+[ -d /etc/rc$runlevel.d ] || exit 0
+
+# Set language, vc settings once to avoid doing it for every init script
+# through functions
+if [ -f /etc/sysconfig/i18n -a -z "${NOLOCALE:-}" ] ; then
+  . /etc/profile.d/lang.sh 2>/dev/null
+  export LANGSH_SOURCED=1
+fi
+
+# First, run the KILL scripts.
+for i in /etc/rc$runlevel.d/K* ; do
+
+	# Check if the subsystem is already up.
+	subsys=${i#/etc/rc$runlevel.d/K??}
+	[ -f /var/lock/subsys/$subsys -o -f /var/lock/subsys/$subsys.init ] || continue
+	check_runlevel "$i" || continue
+
+	# Bring the subsystem down.
+	[ -n "$UPSTART" ] && initctl emit --quiet stopping JOB=$subsys
+	$i stop
+	[ -n "$UPSTART" ] && initctl emit --quiet stopped JOB=$subsys
+done
+
+# Now run the START scripts.
+for i in /etc/rc$runlevel.d/S* ; do
+
+	# Check if the subsystem is already up.
+	subsys=${i#/etc/rc$runlevel.d/S??}
+	[ -f /var/lock/subsys/$subsys ] && continue
+	[ -f /var/lock/subsys/$subsys.init ] && continue
+	check_runlevel "$i" || continue
+		    
+	# If we're in confirmation mode, get user confirmation
+	if [ "$do_confirm" = "yes" ]; then
+		confirm $subsys
+		rc=$?
+		if [ "$rc" = "1" ]; then
+			continue
+		elif [ "$rc" = "2" ]; then
+			do_confirm="no"
+		fi
+	fi
+
+	update_boot_stage "$subsys"
+	# Bring the subsystem up.
+	[ -n "$UPSTART" ] && initctl emit --quiet starting JOB=$subsys
+	if [ "$subsys" = "halt" -o "$subsys" = "reboot" ]; then
+		export LC_ALL=C
+		exec $i start
+	fi
+	$i start
+	[ -n "$UPSTART" ] && initctl emit --quiet started JOB=$subsys
+done
+[ "$do_confirm" = "yes" ] && rm -f /var/run/confirm
+exit 0

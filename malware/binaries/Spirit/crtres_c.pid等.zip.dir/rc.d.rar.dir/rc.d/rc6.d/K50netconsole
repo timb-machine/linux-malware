@@ -1,0 +1,140 @@
+#!/bin/bash
+# 
+# netconsole 	This loads the netconsole module with the configured parameters.
+#
+# chkconfig: - 50 50
+# description: Initializes network console logging
+# config: /etc/sysconfig/netconsole
+#
+# Copyright 2002 Red Hat, Inc.
+#
+# Based in part on a shell script by
+# Andreas Dilger <adilger@turbolinux.com>  Sep 26, 2001
+
+PATH=/sbin:/usr/sbin:$PATH
+RETVAL=0
+SERVER_ADDRESS_RESOLUTION=
+
+# Check that networking is up.
+. /etc/sysconfig/network
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+# Default values
+LOCALPORT=6666
+DEV=
+
+SYSLOGADDR=
+SYSLOGPORT=514
+SYSLOGMACADDR=
+
+kernel=$(uname -r | cut -d. -f1-2)
+
+usage ()
+{
+	echo $"Usage: $0 {start|stop|status|restart|condrestart}" 1>&2
+	RETVAL=2
+}
+
+print_address_info ()
+{
+	local host=$1
+	local route via target
+
+	route=$(LANG=C ip -o route get to $host/32)
+	
+	[ -z "$DEV" ] && DEV=$(echo $route | sed "s|.* dev \([^ ]*\).*|\1|")
+	echo "DEV=$DEV"
+	echo "LOCALADDR=$(echo $route | sed "s|.* src \([^ ]*\).*|\1|")"
+	if [[ $route == *" via "* ]] ; then
+		via=$(echo $route | sed "s|.* via \([^ ]*\).*|\1|")
+		target=$via
+	else
+		target=$host
+	fi
+	if [ -z "$SYSLOGMACADDR" ]; then
+		arp=$(LANG=C /sbin/arping -f -c 1 -I $DEV $target 2>/dev/null | awk '/ reply from .*[.*]/ { print gensub(".* reply from .* \\[(.*)\\].*","\\1","G"); exit }')
+		[ -n "$arp" ] && echo "SYSLOGMACADDR=$arp"
+	fi	
+}	
+	
+start ()
+{
+	[ -f /etc/sysconfig/netconsole ] || exit 6
+	. /etc/sysconfig/netconsole
+
+	SYSLOGOPTS=
+	# syslogd server, if any
+	if [ -n "$SYSLOGADDR" ]; then
+		MATCH="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+		if ! [[ "$SYSLOGADDR" =~ $MATCH ]]; then
+			SYSLOGADDR=$(LANG=C host $SYSLOGADDR 2>/dev/null | awk '/has address / { print $NF }')
+		fi
+	fi
+	if [ -z "$SYSLOGADDR" ] ; then
+		echo $"Server address not specified in /etc/sysconfig/netconsole" 1>&2
+		exit 6
+	fi
+	eval $(print_address_info $SYSLOGADDR)
+	
+	if [ -z "$SYSLOGMACADDR" ]; then
+		echo $"netconsole: can't resolve MAC address of $SYSLOGADDR" 1>&2
+		exit 1
+	fi
+
+	SYSLOGOPTS="netconsole=$LOCALPORT@$LOCALADDR/$DEV,$SYSLOGPORT@$SYSLOGADDR/$SYSLOGMACADDR "
+
+	/usr/bin/logger -p daemon.info -t netconsole: inserting netconsole module with arguments \
+	$SYSLOGOPTS
+	if [ -n "$SYSLOGOPTS" ]; then
+		action $"Initializing netconsole" modprobe netconsole \
+			$SYSLOGOPTS
+		[ "$?" != "0" ] && RETVAL=1
+	fi
+	touch /var/lock/subsys/netconsole
+}
+
+stop ()
+{
+	if /sbin/lsmod | grep netconsole >/dev/null 2>&1 ; then
+	    action $"Disabling netconsole" rmmod netconsole;
+	    [ "$?" != "0" ] && RETVAL=1
+	fi
+
+	rm -f /var/lock/subsys/netconsole
+}
+
+status ()
+{
+	if /sbin/lsmod | grep netconsole >/dev/null 2>&1 ; then
+		echo $"netconsole module loaded"
+		RETVAL=0
+	else
+		echo $"netconsole module not loaded"
+		RETVAL=3
+	fi
+}
+
+
+restart ()
+{
+	stop
+	start
+}
+
+condrestart ()
+{
+	[ -e /var/lock/subsys/netconsole ] && restart
+}
+
+
+case "$1" in
+    stop) stop ;;
+    status) status ;;
+    start|restart|reload|force-reload) restart ;;
+    condrestart) condrestart ;;
+    *) usage ;;
+esac
+
+exit $RETVAL

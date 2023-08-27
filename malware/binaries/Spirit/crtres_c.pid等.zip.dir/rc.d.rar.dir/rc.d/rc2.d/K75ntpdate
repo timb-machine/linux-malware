@@ -1,0 +1,96 @@
+#!/bin/bash
+#
+# chkconfig: - 57 75
+# description: set the date and time via NTP
+
+### BEGIN INIT INFO
+# Provides: ntpdate
+# Required-Start: $network $local_fs $remote_fs
+# Should-Start: $syslog $named
+# Short-Description: set the date and time via NTP
+# Description: ntpdate sets the local clock by polling NTP servers
+### END INIT INFO
+
+# Source function library.
+. /etc/init.d/functions
+
+# Source networking configuration.
+. /etc/sysconfig/network
+
+prog=ntpdate
+lockfile=/var/lock/subsys/$prog
+ntpconf=/etc/ntp.conf
+ntpstep=/etc/ntp/step-tickers
+
+start() {
+	[ "$EUID" != "0" ] && exit 4
+	[ "$NETWORKING" = "no" ] && exit 1
+	[ -x /usr/sbin/ntpdate ] || exit 5
+	[ -f /etc/sysconfig/ntpdate ] || exit 6
+	. /etc/sysconfig/ntpdate
+
+	[ -f $ntpstep ] && tickers=$(sed 's/#.*//' $ntpstep) || tickers=
+
+	if ! echo "$tickers" | grep -qi '[a-z0-9]' && [ -f $ntpconf ]; then
+	    # step-tickers doesn't specify a server,
+	    # use servers from ntp.conf instead
+	    tickers=$(awk '$1=="peer"||$1=="server"{print $2}' $ntpconf | \
+		egrep -v '127\.127\.[0-9]+\.[0-9]+')
+	fi
+
+	if ! echo "$tickers" | grep -qi '[a-z0-9]'; then
+	    echo $"NTP server not specified in $ntpstep or $ntpconf"
+	    exit 6
+	fi
+
+	echo -n $"$prog: Synchronizing with time server: "
+
+	[ -z "$RETRIES" ] && RETRIES=2
+	retry=0
+	while true; do
+		/usr/sbin/ntpdate $OPTIONS $tickers &> /dev/null
+		RETVAL=$?
+		[ $RETVAL -eq 0 ] || [ $retry -ge "$RETRIES" ] && break
+		sleep $[10 * (1 << $retry)]
+		retry=$[$retry + 1]
+	done
+
+	[ $RETVAL -eq 0 ] && success || failure
+	echo
+	if [ $RETVAL -eq 0 ]; then
+	    touch $lockfile
+	    [ "$SYNC_HWCLOCK" = "yes" ] && \
+		action $"Syncing hardware clock to system time" \
+		    /sbin/hwclock --systohc
+	fi
+	return $RETVAL
+}
+
+status() {
+	[ -f $lockfile ] || return 3
+}
+
+stop() {
+	[ "$EUID" != "0" ] && exit 4
+	rm -f $lockfile
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  status)
+	status
+	;;
+  restart|force-reload)
+	stop
+	start
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|status|restart|force-reload}"
+	exit 2
+esac

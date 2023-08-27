@@ -1,0 +1,154 @@
+#!/bin/sh
+#
+# nfslock       This shell script takes care of starting and stopping
+#               the NFS file locking service.
+#
+# chkconfig: 345 14 86
+# description: NFS is a popular protocol for file sharing across \
+#	       networks. This service provides NFS file locking \ 
+#          functionality.
+# probe: true
+
+### BEGIN INIT INFO
+# Provides: nfslock
+# Required-Start: $network $syslog $rpcbind
+# Required-Stop: $network $syslog $rpcbind
+# Default-Start: 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: Start up the NFS file locking sevice
+# Description: NFS is a popular protocol for file sharing across \
+#          networks. This service provides NFS file locking \ 
+#          functionality.
+### END INIT INFO
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+# Source networking configuration.
+if [ ! -f /etc/sysconfig/network ]; then
+    exit 6
+fi
+
+# Check for and source configuration file
+LOCKDARG=""
+STATDARG=""
+[ -f /etc/sysconfig/nfs ] && . /etc/sysconfig/nfs
+
+[ -f /etc/sysconfig/network ] && . /etc/sysconfig/network
+
+uid=`id | cut -d\( -f1 | cut -d= -f2`
+RETVAL=0
+start() {
+	# Check that networking is up.
+	[ "${NETWORKING}" = "no" ] && exit 6
+
+	[ -x /sbin/rpc.statd ] || exit 5 
+
+	# Only root can start the service
+	[ $uid -ne 0 ] && exit 4
+
+	# Make sure the rpc.statd is not already running.
+	if status rpc.statd > /dev/null ; then
+		exit 0
+	fi
+	rm -f /var/lock/subsys/rpc.statd
+
+	# Make sure locks are recovered
+	rm -f /var/run/sm-notify.pid
+
+	# Start daemons.
+	# See if the kernel lockd should start up 
+	# listening on a particular port
+	#
+	if [ -n "$LOCKD_TCPPORT" -o -n "$LOCKD_UDPPORT" ]; then 
+		[ -x /sbin/modprobe ] && /sbin/modprobe lockd $LOCKDARG
+		[ -n "$LOCKD_TCPPORT" ] && \
+			/sbin/sysctl -w fs.nfs.nlm_tcpport=$LOCKD_TCPPORT >/dev/null 2>&1
+		[ -n "$LOCKD_UDPPORT" ] && \
+			/sbin/sysctl -w fs.nfs.nlm_udpport=$LOCKD_UDPPORT >/dev/null 2>&1
+	fi
+
+	echo -n $"Starting NFS statd: "
+	# Set statd's local hostname if defined
+	[ -n "${STATD_HOSTNAME}" ] && STATDARG="$STATDARG -n ${STATD_HOSTNAME}"
+
+	# See if a statd's ports has been defined
+	[ -n "$STATD_PORT" ] && STATDARG="$STATDARG -p $STATD_PORT"
+	[ -n "$STATD_OUTGOING_PORT" ] \
+		&& STATDARG="$STATDARG -o $STATD_OUTGOING_PORT"
+
+	# See if we have an HA-callout program specified
+	[ -n "$STATD_HA_CALLOUT" ] \
+		&& STATDARG="$STATDARG -H $STATD_HA_CALLOUT"
+	daemon rpc.statd "$STATDARG"
+	RETVAL=$?
+	echo
+	[ $RETVAL -eq 0 ] && touch /var/lock/subsys/rpc.statd
+    return $RETVAL
+}
+
+stop() {
+	# Only root can stop the service
+	[ $uid -ne 0 ] && exit 4
+
+	# Stop daemons.
+	if [ -n "`pidofproc lockd`" ]; then
+		echo -n $"Stopping NFS locking: "
+		killproc lockd -KILL
+		echo
+	fi
+
+	echo -n $"Stopping NFS statd: "
+	killproc rpc.statd
+	RETVAL=$?
+	echo
+	rm -f /var/lock/subsys/rpc.statd
+	rm -f /var/run/sm-notify.pid
+	return $RETVAL
+}
+
+# See how we were called.
+case "$1" in
+  start)
+        start
+	;;
+  stop)
+  	stop
+	;;
+  status)
+	status rpc.statd
+	RETVAL=$?
+	;;
+  restart | force-reload | reload)
+	stop
+	start
+	;;
+  probe)
+	if [ ! -f /var/lock/subsys/rpc.statd ] ; then
+	  echo $"start"; exit 0
+	fi
+	/sbin/pidof rpc.statd >/dev/null 2>&1
+	if [ $? = 1 ] ; then
+	  echo $"restart"; exit 0
+	fi
+	;;
+  condrestart | try-restart)
+  	[ -f /var/lock/subsys/rpc.statd ] && {
+		stop
+		start
+		RETVAL=$?
+	}
+	;;
+  condstop)
+  	[ -f /var/lock/subsys/rpc.statd ] && {
+		stop
+		RETVAL=$?
+	}
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|status|restart|reload|force-reload|probe|condrestart|try-restart|condstop}"
+	RETVAL=2
+	;;
+esac
+
+exit $RETVAL

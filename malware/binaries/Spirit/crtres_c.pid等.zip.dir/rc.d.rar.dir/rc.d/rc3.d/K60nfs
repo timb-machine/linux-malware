@@ -1,0 +1,240 @@
+#!/bin/sh
+#
+# nfs           This shell script takes care of starting and stopping
+#               the NFS services.
+#
+# chkconfig: - 30 60
+# description: NFS is a popular protocol for file sharing across networks.
+#              This service provides NFS server functionality, which is \
+#              configured via the /etc/exports file.
+# probe: true
+# config: /etc/sysconfig/nfs
+
+### BEGIN INIT INFO
+# Provides: nfs
+# Required-Start: $local_fs $network $syslog $rpcbind
+# Required-Stop: $local_fs $network $syslog $rpcbind
+# Default-Stop: 0 1 6
+# Short-Description: Start up the NFS server sevice
+# Description: NFS is a popular protocol for file sharing across networks \
+#              This service provides NFS server functionality, \
+#              which is configured via the /etc/exports file.
+### END INIT INFO
+
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+# Source networking configuration.
+[ -f /etc/sysconfig/network ] &&  . /etc/sysconfig/network
+
+# Check for and source configuration file otherwise set defaults
+[ -f /etc/sysconfig/nfs ] && . /etc/sysconfig/nfs
+
+# Remote quota server
+[ -z "$RQUOTAD" ] && RQUOTAD=`type -path rpc.rquotad`
+
+RETVAL=0
+uid=`id | cut -d\( -f1 | cut -d= -f2`
+
+# See how we were called.
+case "$1" in
+  start)
+
+	# Check that networking is up.
+	[ "${NETWORKING}" != "yes" ] && exit 6
+
+	[ -x /usr/sbin/rpc.nfsd ] || exit 5
+	[ -x /usr/sbin/rpc.mountd ] || exit 5
+	[ -x /usr/sbin/exportfs ] || exit 5
+
+	# Make sure the rpc.mountd is not already running.
+	if status rpc.mountd > /dev/null ; then
+		exit 0
+	fi
+
+	# Only root can start the service
+	[ $uid -ne 0 ] && exit 4
+
+	# Don't fail if /etc/exports doesn't exist; create a bare-bones 
+	# version and continue.
+	[ -r /etc/exports ] || \
+    	{ touch /etc/exports && chmod u+rw,g+r,o+r /etc/exports ; } || \
+    	{ echo "/etc/exports does not exist" ; exit 0 ; }
+
+	[ -z "$MOUNTD_NFS_V2" ] && MOUNTD_NFS_V2=default
+	[ -z "$MOUNTD_NFS_V3" ] && MOUNTD_NFS_V3=default
+
+	# Number of servers to be started by default
+	[ -z "$RPCNFSDCOUNT" ] && RPCNFSDCOUNT=8
+
+	# Start daemons.
+	[ -x /usr/sbin/rpc.svcgssd ] && /sbin/service rpcsvcgssd start
+
+	# Set the ports lockd should listen on
+	if [ -n "$LOCKD_TCPPORT" -o -n "$LOCKD_UDPPORT" ]; then 
+		[ -x /sbin/modprobe ] && /sbin/modprobe lockd $LOCKDARG
+		[ -n "$LOCKD_TCPPORT" ] && \
+			/sbin/sysctl -w fs.nfs.nlm_tcpport=$LOCKD_TCPPORT >/dev/null 2>&1
+		[ -n "$LOCKD_UDPPORT" ] && \
+			/sbin/sysctl -w fs.nfs.nlm_udpport=$LOCKD_UDPPORT >/dev/null 2>&1
+	fi
+
+	# Load the nfsd module so /proc/fs/nfsd will exist
+	[ "$NFSD_MODULE" != "noload" -a -x /sbin/modprobe ] && {
+		/sbin/modprobe nfsd
+		[ -n "$RDMA_PORT" ] && /sbin/modprobe svcrdma
+	}
+	# Set v4 grace period if requested
+	[ -n "$NFSD_V4_GRACE" ] && {
+		echo "$NFSD_V4_GRACE" > /proc/fs/nfsd/nfsv4gracetime
+	}
+	action $"Starting NFS services: " /usr/sbin/exportfs -r
+
+	if [ -n "$RQUOTAD" -a "$RQUOTAD" != "no" ]; then
+	    echo -n $"Starting NFS quotas: "
+		[ -n "$RQUOTAD_PORT" ] \
+			&& RPCRQUOTADOPTS="$RPCRQUOTADOPTS -p $RQUOTAD_PORT"
+	    daemon rpc.rquotad $RPCRQUOTADOPTS
+		touch /var/lock/subsys/rpc.rquotad
+		RETVAL=$?
+	    echo
+	fi
+
+
+	[ -n "$MOUNTD_PORT" ] \
+	&& RPCMOUNTDOPTS="$RPCMOUNTDOPTS -p $MOUNTD_PORT"
+
+	case $MOUNTD_NFS_V1 in
+	no|NO)
+	    RPCMOUNTDOPTS="$RPCMOUNTDOPTS --no-nfs-version 1" ;;
+	esac
+
+	case $MOUNTD_NFS_V2 in
+	no|NO)
+	    RPCMOUNTDOPTS="$RPCMOUNTDOPTS --no-nfs-version 2" ;;
+	esac
+
+	case $MOUNTD_NFS_V3 in
+	no|NO)
+	    RPCMOUNTDOPTS="$RPCMOUNTDOPTS --no-nfs-version 3" ;;
+	esac
+
+	echo -n $"Starting NFS mountd: "
+	daemon rpc.mountd $RPCMOUNTDOPTS
+	RETVAL=$?
+	echo
+	touch /var/lock/subsys/rpc.mountd
+	touch /var/lock/subsys/nfs
+
+	echo -n $"Starting NFS daemon: "
+	daemon rpc.nfsd $RPCNFSDARGS $RPCNFSDCOUNT
+	RETVAL=$?
+	echo
+	[ $RETVAL -ne 0 ] && exit $RETVAL
+
+	[ -n "$RDMA_PORT" ] && echo "rdma $RDMA_PORT" > /proc/fs/nfsd/portlist
+
+	# Start rpc.idmapd 
+	[ -x /usr/sbin/rpc.idmapd ] && /sbin/service rpcidmapd start
+
+	;;
+  stop)
+	# Only root can stop the service
+	[ $uid -ne 0 ] && exit 4
+
+	# Stop daemons.
+	echo -n $"Shutting down NFS daemon: "
+	killproc nfsd -2
+	RETVAL=$?
+	echo
+
+	echo -n $"Shutting down NFS mountd: "
+	killproc rpc.mountd
+	rval=$?
+	[ $RETVAL -eq 0 ] && RETVAL=$rval
+	echo
+	if [ -n "$RQUOTAD" -a "$RQUOTAD" != "no" ]; then
+		echo -n $"Shutting down NFS quotas: "
+		killproc rpc.rquotad
+		rval=$?
+		[ $RETVAL -eq 0 ] && RETVAL=$rval
+		echo
+	fi
+	# Reset the lockd ports if they were set
+	if [ -n "$LOCKD_TCPPORT" ]; then
+	    /sbin/sysctl -w fs.nfs.nlm_tcpport=0 >/dev/null 2>&1
+	fi
+	if [ -n "$LOCKD_UDPPORT" ]; then
+	    /sbin/sysctl -w fs.nfs.nlm_udpport=0 >/dev/null 2>&1
+	fi
+	# Do it the last so that clients can still access the server
+	# when the server is running.
+	cnt=`/usr/sbin/exportfs -v | /usr/bin/wc -l`	
+	if [ $cnt -gt 0 ]; then 
+		action $"Shutting down NFS services: " /usr/sbin/exportfs -au
+		rval=$?
+		[ $RETVAL -eq 0 ] && RETVAL=$rval
+	fi
+	[ -x /usr/sbin/rpc.svcgssd ] && /sbin/service rpcsvcgssd stop
+	[ -x /usr/sbin/rpc.idmapd ] && /sbin/service rpcidmapd stop
+	rm -f /var/lock/subsys/nfs
+	rm -f /var/lock/subsys/rpc.mountd
+	rm -f /var/lock/subsys/rpc.rquotad
+	;;
+  status)
+	[ -x /usr/sbin/rpc.svcgssd ] && /sbin/service rpcsvcgssd status
+	status rpc.mountd
+	RETVAL=$?
+	status -l nfs nfsd
+	rval=$?
+	[ $RETVAL -eq 0 ] && RETVAL=$rval
+	if [ -n "$RQUOTAD" -a "$RQUOTAD" != "no" ]; then
+		status rpc.rquotad
+		rval=$?
+		[ $RETVAL -eq 0 ] && RETVAL=$rval
+	fi
+	;;
+  restart)
+	$0 stop
+	$0 start
+	;;
+  reload | force-reload)
+	/usr/sbin/exportfs -r
+	[ -f /var/lock/subsys/nfs ] && touch /var/lock/subsys/nfs
+	;;
+  probe)
+	if [ ! -f /var/lock/subsys/nfs ] ; then
+	  echo $"start"; exit 0
+	fi
+	/sbin/pidof rpc.mountd >/dev/null 2>&1; MOUNTD="$?"
+	/sbin/pidof nfsd >/dev/null 2>&1; NFSD="$?"
+	if [ $MOUNTD = 1 -o $NFSD = 1 ] ; then
+	  echo $"restart"; exit 0
+	fi
+	if [ /etc/exports -nt /var/lock/subsys/nfs ] ; then
+	  echo $"reload"; exit 0
+	fi
+	;;
+  condrestart | try-restart)
+	[ -x /usr/sbin/rpc.svcgssd ] && /sbin/service rpcsvcgssd condrestart
+  	[ -f /var/lock/subsys/nfs ] && {
+		$0 stop
+		$0 start
+		RETVAL=$?
+	}
+	;;
+  condstop)
+	[ -x /usr/sbin/rpc.svcgssd ] && /sbin/service rpcsvcgssd condstop
+  	[ -f /var/lock/subsys/nfs ] && {
+		$0 stop
+		RETVAL=$?
+	}
+	;;
+  *)
+	echo $"Usage: nfs {start|stop|status|restart|reload|force-reload|condrestart|try-restart|condstop}"
+	RETVAL=2
+	;;
+esac
+
+exit $RETVAL

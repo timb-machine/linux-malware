@@ -1,0 +1,133 @@
+#!/bin/sh
+#
+#
+# chkconfig: - 12 88
+# description: Provides a set of daemons to manage access to remote directories
+#              and authentication mechanisms. It provides an NSS and PAM
+#              interface toward the system and a pluggable backend system to
+#              connect to multiple different account sources. It is also the
+#              basis to provide client auditing and policy services for projects
+#              like FreeIPA.
+#
+### BEGIN INIT INFO
+# Provides: sssd
+# Required-Start: $remote_fs $time
+# Should-Start: $syslog
+# Should-Stop: $null
+# Required-Stop: $null
+# Default-Stop: 0 1 6
+# Short-Description: System Security Services Daemon
+# Description: Provides a set of daemons to manage access to remote directories
+#              and authentication mechanisms. It provides an NSS and PAM
+#              interface toward the system and a pluggable backend system to
+#              connect to multiple different account sources. It is also the
+#              basis to provide client auditing and policy services for projects
+#              like FreeIPA.
+### END INIT INFO
+
+RETVAL=0
+prog="sssd"
+
+# Source function library.
+. /etc/init.d/functions
+
+if [ -f /etc/sysconfig/sssd ]; then
+    . /etc/sysconfig/sssd
+fi
+
+SSSD=/usr/sbin/sssd
+
+LOCK_FILE=/var/lock/subsys/sssd
+PID_FILE=/var/run/sssd.pid
+
+start() {
+    [ -x $SSSD ] || exit 5
+    echo -n $"Starting $prog: "
+    daemon $SSSD -f -D && success || failure
+    RETVAL=$?
+    echo
+    [ "$RETVAL" = 0 ] && touch $LOCK_FILE
+    return $RETVAL
+}
+
+stop() {
+    echo -n $"Stopping $prog: "
+    pid=`cat $PID_FILE`
+
+    killproc -p $PID_FILE $SSSD -TERM
+    RETVAL=$?
+
+    # Wait until the monitor exits
+    while (checkpid $pid)
+    do
+        usleep 100000
+    done
+
+    echo
+    [ "$RETVAL" = 0 ] && rm -f $LOCK_FILE
+    return $RETVAL
+}
+
+reload() {
+    echo -n $"Reloading $prog: "
+    killproc $SSSD -HUP
+    RETVAL=$?
+    echo
+    return $RETVAL
+}
+
+restart() {
+        stop
+        start
+}
+
+force_reload() {
+    restart
+}
+
+rh_status() {
+    # run checks to determine if the service is running or use generic status
+    status $prog
+}
+
+rh_status_q() {
+    rh_status >/dev/null 2>&1
+}
+
+case "$1" in
+    start)
+        rh_status_q && exit 0
+        $1
+        ;;
+
+    stop)
+        rh_status_q || exit 0
+        $1
+        ;;
+
+    restart)
+        $1
+        ;;
+
+    reload)
+        rh_status_q || exit 7
+        $1
+        ;;
+
+    force-reload)
+        force_reload
+        ;;
+
+    status)
+        rh_status
+        ;;
+
+    condrestart|try-restart)
+        rh_status_q || exit 0
+        restart
+        ;;
+    *)
+    echo $"Usage: $0 {start|stop|status|restart|condrestart|try-restart|reload|force-reload}"
+    exit 2
+esac
+exit $?

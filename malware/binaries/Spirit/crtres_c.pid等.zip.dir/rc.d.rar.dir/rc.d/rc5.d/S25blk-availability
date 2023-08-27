@@ -1,0 +1,58 @@
+#!/bin/bash
+#
+# Copyright (C) 2012 Red Hat, Inc. All rights reserved.
+#
+# This copyrighted material is made available to anyone wishing to use,
+# modify, copy, or redistribute it subject to the terms and conditions
+# of the GNU General Public License v.2.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software Foundation,
+# Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+# This file is part of LVM2.
+# It is required for the proper handling of failures of LVM2 mirror
+# devices that were created using the -m option of lvcreate.
+#
+#
+# chkconfig: 12345 25 75
+# description: Controls availability of block devices
+#
+# For Red-Hat-based distributions such as Fedora, RHEL, CentOS.
+#	       
+### BEGIN INIT INFO
+# Provides: blk-availability
+# Required-Start:
+# Required-Stop:
+# Default-Start: 1 2 3 4 5
+# Default-Stop: 0 6
+# Short-Description: Availability of block devices
+### END INIT INFO
+
+. /etc/init.d/functions
+
+sbindir=/sbin
+script=blkdeactivate
+options="-u -l wholevg"
+
+LOCK_FILE="/var/lock/subsys/blk-availability"
+
+
+rtrn=1
+
+case "$1" in
+  start)
+	touch $LOCK_FILE
+	;;
+
+  stop)
+	action "Stopping block device availability:" $sbindir/$script $options
+	rm -f $LOCK_FILE
+	;;
+
+  status)
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|status}"
+	;;
+esac

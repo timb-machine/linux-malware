@@ -1,0 +1,112 @@
+#!/bin/bash
+#
+# Copyright (C) 2012 Red Hat, Inc. All rights reserved.
+#
+# This copyrighted material is made available to anyone wishing to use,
+# modify, copy, or redistribute it subject to the terms and conditions
+# of the GNU General Public License v.2.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software Foundation,
+# Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+# This file is part of LVM2.
+# It is required for the proper handling of failures of LVM2 mirror
+# devices that were created using the -m option of lvcreate.
+#
+#
+# chkconfig: 12345 02 99
+# description: Starts and stops LVM metadata daemon
+#
+# For Red-Hat-based distributions such as Fedora, RHEL, CentOS.
+#
+### BEGIN INIT INFO
+# Provides: lvm2-lvmetad
+# Required-Start: $local_fs
+# Required-Stop: $local_fs
+# Default-Start: 1 2 3 4 5
+# Default-Stop: 0 6
+# Short-Description: A daemon that maintains LVM metadata state for improved
+#                    performance by avoiding further scans while running
+#                    subsequent LVM commands or while using lvm2app library.
+### END INIT INFO
+
+. /etc/init.d/functions
+
+DAEMON=lvmetad
+
+exec_prefix=
+sbindir=/sbin
+
+LOCK_FILE="/var/lock/subsys/$DAEMON"
+PID_FILE="/var/run/lvmetad.pid"
+
+rh_status() {
+	status -p $PID_FILE $DAEMON
+}
+
+rh_status_q() {
+	rh_status >/dev/null 2>&1
+}
+
+start()
+{
+	ret=0
+	action "Starting LVM metadata daemon:" $DAEMON || ret=$?
+	return $ret
+}
+
+
+stop()
+{
+	ret=0
+	action "Signaling LVM metadata daemon to exit:" killproc -p $PID_FILE $DAEMON -TERM || ret=$?
+	return $ret
+}
+
+rtrn=1
+
+# See how we were called.
+case "$1" in
+  start)
+	rh_status_q && exit 0
+	start
+	rtrn=$?
+	[ $rtrn = 0 ] && touch $LOCK_FILE
+	;;
+
+  stop|force-stop)
+	rh_status_q || exit 0
+	stop
+	rtrn=$?
+	[ $rtrn = 0 ] && rm -f $LOCK_FILE
+	;;
+
+  restart)
+	if stop
+	then
+		start
+	fi
+	rtrn=$?
+	;;
+
+  condrestart|try-restart)
+	rh_status_q || exit 0
+	if stop
+	then
+		start
+	fi
+	rtrn=$?
+	;;
+
+  status)
+	rh_status
+	rtrn=$?
+	;;
+
+  *)
+	echo $"Usage: $0 {start|stop|force-stop|restart|condrestart|try-restart|status}"
+	;;
+esac
+
+exit $rtrn

@@ -1,0 +1,82 @@
+#!/bin/bash
+#
+# psacct	Script to control kernel process accounting
+#
+# Author:       Mike A. Harris <mharris@redhat.com>
+#
+# chkconfig: - 90 10
+# description:  Starts and stops process accounting
+# short-description:  Starts and stops process accounting
+
+### BEGIN INIT INFO
+# Required-Start:
+# Required-Stop:
+# Provides: psacct
+# Default-Start:
+# Default-Stop: 0 1 2 3 4 5 6
+# Description: Starts and stops process accounting
+# Short-Description: Starts and stops process accounting
+### END INIT INFO
+
+# Source function library.
+. /etc/init.d/functions
+
+# The location of the accounting file
+ACCTFILE=/var/account/pacct
+LOCKFILE=/var/lock/subsys/psacct
+
+start() {
+	[ ! -r $ACCTFILE ] && touch $ACCTFILE && chmod 600 $ACCTFILE
+	if [ -r $ACCTFILE ]; then 
+	    action $"Starting process accounting: " /sbin/accton $ACCTFILE
+	    RETVAL=$?
+    	    if [ $RETVAL -eq 0 ]; then
+		touch $LOCKFILE
+	    else 
+		exit 7
+	    fi
+	else 
+	    exit 4
+	fi
+}
+
+stop() {
+	
+	action $"Shutting down process accounting: " /sbin/accton
+	RETVAL=$?
+	if [ $RETVAL -eq 0 ]; then
+	    rm -f $LOCKFILE
+	else
+	    exit 1
+	fi
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  status)
+	if [ -e $LOCKFILE ]; then
+		echo $"Process accounting is enabled."
+	else
+		echo $"Process accounting is disabled."
+		exit 3
+	fi
+	;;
+  restart|reload|force-reload)
+	stop
+	start
+	;;
+  *)
+	# do not advertise unreasonable commands that there is no reason
+	# to use with this device
+	echo $"Usage: $0 {start|stop|status|restart|reload|force-reload}"
+	exit 2
+esac
+
+exit 0
+

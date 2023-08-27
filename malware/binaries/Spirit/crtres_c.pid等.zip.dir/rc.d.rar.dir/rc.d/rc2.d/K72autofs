@@ -1,0 +1,222 @@
+#!/bin/bash
+#
+# rc file for automount using a Sun-style "master map".
+#
+# chkconfig: 345 28 72
+# processname: /usr/sbin/automount
+# config: /etc/auto.master
+# description: Automounts filesystems on demand
+#
+### BEGIN INIT INFO
+# Provides: $autofs
+# Required-Start: $network $ypbind
+# Required-Stop: $network $ypbind
+# Default-Start: 3 4 5
+# Default-Stop: 0 1 2 6
+# Short-Description: Automounts filesystems on demand
+# Description: Automounts filesystems on demand
+### END INIT INFO
+#
+# Location of the automount daemon and the init directory
+#
+DAEMON=/usr/sbin/automount
+prog=`basename $DAEMON`
+MODULE="autofs4"
+DEVICE="autofs"
+initdir=/etc/init.d
+confdir=/etc/sysconfig
+
+test -e $DAEMON || exit 0
+
+if [ -r $initdir/functions ]; then
+	. $initdir/functions
+fi
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
+
+#
+# load customized configuation settings
+#
+if [ -r $confdir/autofs ]; then
+	. $confdir/autofs
+fi
+
+function start() {
+	# Make sure autofs4 module is loaded
+	if ! grep -q autofs /proc/filesystems
+	then
+		echo -n "Loading $MODULE: "
+		# Try load the autofs4 module fail if we can't
+		modprobe $MODULE >/dev/null 2>&1
+		RETVAL=$?
+		if [ $RETVAL -eq 1 ]
+		then
+			failure "Load $MODULE"
+			echo
+			return $RETVAL
+		else
+			success "Load $MODULE"
+			echo
+		fi
+	elif ([ -f /proc/modules ] && lsmod) | grep -q autofs[^4]
+	then
+		RETVAL=1
+		failure "Load $MODULE"
+		echo
+		return $RETVAL
+	fi
+
+	# Check misc device
+	if [ -n "$USE_MISC_DEVICE" -a "x$USE_MISC_DEVICE" = "xyes" ]; then
+		sleep 1
+		if [ -e "/proc/misc" ]; then
+			MINOR=`awk "/$DEVICE/ {print \\$1}" /proc/misc`
+			if [ -n "$MINOR" -a ! -c "/dev/$DEVICE" ]; then
+				mknod -m 0600 /dev/$DEVICE c 10 $MINOR
+			fi
+		fi
+		if [ -x /sbin/restorecon -a -c /dev/$DEVICE ]; then
+			/sbin/restorecon /dev/$DEVICE
+		fi
+	else
+		if [ -c /dev/$DEVICE ]; then
+			rm /dev/$DEVICE
+		fi
+	fi
+
+	echo -n $"Starting $prog: "
+	$prog $OPTIONS --pid-file /var/run/autofs.pid
+	RETVAL=$?
+	if [ $RETVAL -eq 0 ] ; then
+		success "$prog startup"
+	else
+		failure "$prog startup"
+	fi
+	if [ $RETVAL -eq 0 ]; then
+		touch /var/lock/subsys/autofs
+	else
+		RETVAL=1
+	fi
+	echo
+	return $RETVAL
+}
+
+function stop() {
+	echo -n $"Stopping $prog: "
+	count=0
+	while [ -n "`pidof $prog`" -a $count -lt 15 ] ; do
+		killproc $prog -TERM >& /dev/null
+		RETVAL=$?
+		[ $RETVAL = 0 -a -z "`pidof $prog`" ] || sleep 3
+		count=`expr $count + 1`
+	done
+	if [ $RETVAL -eq 0 ]; then
+		rm -f /var/lock/subsys/autofs
+	else
+		RETVAL=1
+	fi
+	if [ -n "`pidof $prog`" ] ; then
+		failure "$prog shutdown"
+	else
+		success "$prog shutdown"
+	fi
+	echo
+	return $RETVAL
+}
+
+function restart() {
+	status autofs > /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		stop
+		if [ -n "`pidof $prog`" ]; then
+			# If we failed to stop, try at least one more time
+			# after waiting a little while
+			sleep 20
+			stop
+			auto_pid=`pidof $prog`
+			if [ -n "$auto_pid" ]; then
+				kill -9 $auto_pid
+			fi
+		fi
+	fi
+	start
+}
+
+function reload() {
+	if [ ! -f /var/lock/subsys/autofs ]; then
+		echo $"$prog not running"
+		RETVAL=1
+		return $RETVAL
+	fi
+	pid=`pidof $prog`
+	if [ -z $pid ]; then
+		echo $"$prog not running"
+		RETVAL=1
+	else
+		kill -HUP $pid 2> /dev/null
+		echo $"Reloading maps"
+		RETVAL=0
+	fi
+	return $RETVAL
+}
+
+function usage_message() {
+	echo $"Usage: $0 {start|forcestart|stop|status|restart|force-reload|forcerestart|reload|condrestart|try-restart|usage}"
+}
+
+RETVAL=0
+
+# allow non-root users to read status / usage
+
+case "$1" in
+	status)
+		status -p /var/run/autofs.pid -l autofs $prog
+		exit $?;
+		;;
+	usage)
+		usage_message
+		exit 0;
+		;;
+esac
+
+# Only the root user may change the service status
+if [ `id -u` -ne 0 ]; then
+	echo "insufficient privilege to change service status"
+	exit 4
+fi
+
+case "$1" in
+	start)
+		start
+		;;
+	forcestart)
+		OPTIONS="$OPTIONS --force"
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart|force-reload)
+		restart
+		;;
+	forcerestart)
+		OPTIONS="$OPTIONS --force"
+		restart
+		;;
+	reload)
+		reload
+		;;
+	condrestart|try-restart)
+		if [ -f /var/lock/subsys/autofs ]; then
+			restart
+		fi
+		;;
+	*)
+		usage_message
+		exit 2
+		;;
+esac
+
+exit $?
+

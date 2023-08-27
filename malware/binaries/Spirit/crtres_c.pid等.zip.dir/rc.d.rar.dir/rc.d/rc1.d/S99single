@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+#
+# rc.single     This file is executed by init when it goes into runlevel
+#               1, which is the administrative state. It kills all
+#               deamons and then puts the system into single user mode.
+#               Note that the file systems are kept mounted.
+#
+# Author:       Miquel van Smoorenburg, <miquels@drinkel.nl.mugnet.org>
+#               Modified for RHS Linux by Damien Neil
+#
+
+. /etc/init.d/functions
+
+if [ "$1" != "start" ]; then
+   exit 0
+fi
+
+# this looks nicer
+[ -x /usr/bin/clear ] && /usr/bin/clear
+
+# Now go to the single user level.
+echo $"Telling INIT to go to single user mode."
+exec init -t1 S

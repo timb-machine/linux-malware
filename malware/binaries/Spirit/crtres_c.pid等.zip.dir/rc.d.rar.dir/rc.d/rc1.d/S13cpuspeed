@@ -1,0 +1,390 @@
+#!/bin/sh
+
+# the following is the LSB init header see
+# http://www.linux-foundation.org/spec//booksets/LSB-Core-generic/LSB-Core-generic.html#INITSCRCOMCONV
+#
+### BEGIN INIT INFO
+# Provides: cpuspeed
+# Should-Start: 
+# Default-Start: 1 2 3 4 5
+# Short-Description: processor frequency scaling support
+# Description: This script enables/disables processor frequency
+#              scaling support, either using the cpuspeed daemon
+#              or in-kernel frequency scaling support
+### END INIT INFO
+
+# the following is the chkconfig init header
+#
+# cpuspeed: processor frequency scaling support
+#
+# chkconfig: 12345 13 99
+# description: Run dynamic CPU speed daemon and/or load appropriate
+#              cpu frequency scaling kernel modules and/or governors
+#
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+prog="cpuspeed"
+
+[ -f /usr/sbin/$prog ] || exit 5
+
+# Get config.
+if [ -f /etc/sysconfig/$prog ]; then
+  . /etc/sysconfig/$prog
+fi
+
+cpu0freqd=/sys/devices/system/cpu/cpu0/cpufreq
+globfreq='/sys/devices/system/cpu'
+cpufreq="${globfreq}/cpufreq"
+cpus="${globfreq}/cpu[0-9]*"
+testpat="${cpus}/cpufreq/scaling_driver"
+lockfile="/var/lock/subsys/$prog"
+xendir="/proc/xen"
+logger="/usr/bin/logger -p info -t $prog"
+IGNORE_NICE=${IGNORE_NICE:-0}
+module_loaded=false
+
+some_file_exist() {
+  while [ "$1" ] ; do
+    [ -f "$1" ] && return 0
+    shift
+  done
+  return 1
+}
+
+governor_is_module() {
+  # Check to see if the requested cpufreq governor
+  # is provided as a kernel module or not
+  module_info=`/sbin/modinfo cpufreq-${governor} > /dev/null 2>&1`
+  return $?
+}
+
+is_p4_clockmod() {
+  if [ `/sbin/lsmod | grep -c -w "p4.clockmod"` -ge 1 -a -d "/sys/devices/system/cpu/cpu0/thermal_throttle" ]; then
+    return 0
+  fi
+  return 1
+}
+
+governor_module_loaded() {
+# Check to see if we have a module loaded for
+# the current cpufreq governor
+  if [ -e ${cpu0freqd}/scaling_governor ]; then
+    governor=`cat ${cpu0freqd}/scaling_governor`
+  else
+    governor="none"
+  fi
+  if [ "${governor}" != "none" -a `/sbin/lsmod | grep -c -w "cpufreq.${governor}"` -ge 1 ]; then
+    return 0
+  fi
+  return 1
+}
+
+adjust_cpufreq() {
+  # First arg is a param under $cpu/cpufreq/
+  # Second arg is the value you want to set that param to
+  if $(echo ${1} | grep -qE '(threshold|ignore_nice_load)'); then
+    echo $2 > $cpufreq/$1
+  else
+    for cpu in ${cpus}; do
+      echo $2 > $cpu/cpufreq/$1
+    done
+  fi
+}
+
+start_cpuspeed() {
+  echo -n $"Starting $prog: "
+  # cpuspeed daemon thresholds are specified as idle percentages,
+  # cpufreq modules as busy percentages, so we need to do some
+  # math here for use of unified config...
+  # DOWN_THRESHOLD doesn't mean exactly the same thing for
+  # cpuspeed as it does for the cpufreq governors, but close
+  # enough, and if not specified, we use same defaults as governors.
+  if [ -n "$UP_THRESHOLD" ]; then
+    let UP_THRESHOLD=100-$UP_THRESHOLD
+  else
+    UP_THRESHOLD=20
+  fi
+  if [ -n "$DOWN_THRESHOLD" ]; then
+    let DOWN_THRESHOLD=100-$DOWN_THRESHOLD
+  else
+    DOWN_THRESHOLD=80
+  fi
+  OPTS="$OPTS -r -p $UP_THRESHOLD $DOWN_THRESHOLD"
+  if [ -n "$MIN_SPEED" ]; then
+    OPTS="$OPTS -m $MIN_SPEED"
+  fi
+  if [ -n "$MAX_SPEED" ]; then
+    OPTS="$OPTS -M $MAX_SPEED"
+  fi
+  if [ "$IGNORE_NICE" -eq 0 ]; then
+    OPTS="$OPTS -n"
+  fi
+  daemon $prog -d $OPTS
+  RETVAL=$?
+  return $RETVAL
+}
+
+stop_cpuspeed() {
+  if [ -n "`pidof $prog`" ]; then
+    echo -n $"Stopping $prog: "
+    killproc $prog -USR1
+    killproc $prog -INT
+  fi
+  if [ -n "`pidof $prog`" ]; then
+    killproc $prog
+  fi
+  RETVAL=$?
+  return $RETVAL
+}
+
+start() {
+  if [ $(id -u) -ne 0 ]; then
+    echo -n "Insufficient privileges to start cpuspeed service: "
+    failure; echo
+    return 4
+  fi
+  if [ ! -f $lockfile ] && [ ! -d "$xendir" ]; then
+    cpu_vendor=$(awk '/vendor_id/{print $3}' /proc/cpuinfo | tail -n 1)
+    cpu_family=$(awk '/cpu family/{print $4}' /proc/cpuinfo | tail -n 1)
+    if ! some_file_exist $testpat ; then
+      # Attempt to load scaling_driver if not loaded
+      # but it is configured
+      if [ -n "$DRIVER" ]; then
+        /sbin/modprobe "$DRIVER"
+      elif [ -d /proc/acpi ]; then
+        /sbin/modprobe pcc-cpufreq 2> /dev/null
+	if [ ! -d ${cpu0freqd} ]; then
+	  /sbin/modprobe -r pcc-cpufreq 2> /dev/null
+      	  if [ "$cpu_vendor" == AuthenticAMD ] && [ "$cpu_family" -ge 7 ]; then
+            # Try loading powernow-k8 if this is an AMD processor,
+            # family 7 or greater (Athlon XP/MP was family 6)
+            pk8m=$(/sbin/modinfo powernow-k8 > /dev/null 2>&1)
+            if [ "$?" -eq 0 ]; then
+              /sbin/modprobe powernow-k8 2> /dev/null
+              [ -d ${cpu0freqd} ] || /sbin/modprobe -r powernow-k8 2> /dev/null
+            fi
+	  else
+            # use ACPI as a fallback 
+            /sbin/modprobe acpi-cpufreq 2> /dev/null
+            # if even ACPI didn't work, remove it
+            # and then next test will bail out.
+            [ -d ${cpu0freqd} ] || /sbin/modprobe -r acpi-cpufreq 2> /dev/null
+          fi
+	fi
+      fi
+      if [ ! -d ${cpu0freqd} -a "$cpu_vendor" == GenuineIntel ]; then
+        # last-ditch effort for Intel proc boxes, try our neutered p4-clockmod
+        # to get at least passive cooling support (no clock changes)
+        /sbin/modprobe p4-clockmod 2> /dev/null
+        [ -d ${cpu0freqd} ] || /sbin/modprobe -r p4-clockmod 2> /dev/null
+      fi
+    fi
+
+    # If we get this far with no driver, we must have no scaling.
+    # We're doomed.
+    [ ! -f ${cpu0freqd}/scaling_driver ] && return 6
+
+    # Okay, we have a driver, carry on...
+    drv=`cat ${cpu0freqd}/scaling_driver`
+
+    # Figure out default governor to use
+    case "$drv" in
+      centrino|powernow-k8|pcc-cpufreq|acpi-cpufreq|e_powersaver)
+        default_governor=ondemand
+        ;;
+      p4-clockmod)
+        # not actually a governor, we want to bail without doing either
+	# in-kernel scaling or starting up the cpuspeed daemon in this case
+        default_governor=p4passive
+        ;;
+      *)
+        default_governor=userspace
+        ;;
+    esac
+    governor=${GOVERNOR:-${default_governor}}
+
+    if [ "${governor}" == "p4passive" ]; then
+      echo -n "Enabling p4-clockmod driver (passive cooling only): "
+      success; echo
+      return 0
+    fi
+
+    # Load governor module, if need be, and validate
+    governor_is_module && /sbin/modprobe cpufreq-${governor}
+    if [ `grep -c -w ${governor} ${cpu0freqd}/scaling_available_governors` -ge 1 ]; then
+      $logger "Enabling ${governor} cpu frequency scaling governor"
+    else
+      $logger "Invalid governor \"${governor}\" specified, falling back to ${default_governor}"
+      governor_is_module && /sbin/modprobe -r cpufreq-${governor}
+      governor=${default_governor}
+      governor_is_module && /sbin/modprobe cpufreq-${governor}
+    fi
+
+    # Set governor
+    adjust_cpufreq scaling_governor ${governor}
+
+    # Run cpuspeed daemon for userspace gov, kernel ones otherwise
+    if [ "${governor}" == "userspace" ]; then
+      start_cpuspeed
+      RETVAL=$?
+    else
+      if [ -n "$MIN_SPEED" ]; then
+        adjust_cpufreq scaling_min_freq $MIN_SPEED
+      else
+        adjust_cpufreq scaling_min_freq 0
+      fi
+      if [ -n "$MAX_SPEED" ]; then
+        adjust_cpufreq scaling_max_freq $MAX_SPEED
+      else
+        adjust_cpufreq scaling_max_freq `cat $cpu0freqd/cpuinfo_max_freq`
+      fi
+      if [ -n "$UP_THRESHOLD" -a ${governor} == "ondemand" ]; then
+        adjust_cpufreq ondemand/up_threshold $UP_THRESHOLD
+      fi
+      if [ -n "$DOWN_THRESHOLD" -a ${governor} == "conservative" ]; then
+        adjust_cpufreq conservative/down_threshold $DOWN_THRESHOLD
+      fi
+      if [ "$IGNORE_NICE" -eq 1 -a ${governor} == "ondemand" -o ${governor} == "conservative" ]; then
+        adjust_cpufreq ${governor}/ignore_nice_load $IGNORE_NICE
+      fi
+      echo -n "Enabling ${governor} cpu frequency scaling: "
+      success
+      RETVAL=0
+    fi
+    echo
+    # Technically, not quite right in non-cpuspeed daemon
+    # cases, but close enough to indicate that we're
+    # doing some sort of cpu frequency scaling.
+    [ $RETVAL = 0 ] && touch $lockfile
+  else
+    if [ -d "$xendir" ]; then
+      $logger "CPU Frequency scaling is currently not supported on xen kernels"
+    fi
+    return 0
+  fi
+  return $RETVAL
+}
+
+stop() {
+  if [ $(id -u) -ne 0 ]; then
+    echo -n "Insufficient privileges to stop cpuspeed service: "
+    failure; echo
+    return 4
+  fi
+  is_p4_clockmod && p4status="true"
+  if [ "$p4status" == "true" -a "x${GOVERNOR}" == "x" ]; then
+    echo "p4-clockmod passive cooling support cannot be truly stopped"
+  fi
+  [ ! -f ${cpu0freqd}/scaling_driver ] && return 0
+  drv=`cat ${cpu0freqd}/scaling_driver`
+  governor_module_loaded && module_loaded=true
+
+  if [ "${governor}" != "userspace" ]; then
+    echo -n "Disabling ${governor} cpu frequency scaling: "
+    $logger "Disabling ${governor} cpu frequency scaling governor"
+    for cpu in ${cpus}; do
+      echo userspace > $cpu/cpufreq/scaling_governor
+      cat $cpu/cpufreq/cpuinfo_max_freq > $cpu/cpufreq/scaling_setspeed
+    done
+    if [ $module_loaded == true ]; then
+      /sbin/modprobe -r cpufreq-${governor}
+    fi
+    success
+    RETVAL=0
+  else
+    stop_cpuspeed
+    RETVAL=$?
+  fi
+  echo
+  [ -n "$DRIVER" ] && /sbin/modprobe -r $DRIVER
+  [ $RETVAL = 0 ] && RETVAL=$?
+  [ $RETVAL = 0 ] && rm -f $lockfile
+  return $RETVAL
+}
+
+reload() {
+  if [ $(id -u) -ne 0 ]; then
+    echo -n "Insufficient privileges to stop cpuspeed service: "
+    failure; echo
+    return 4
+  fi
+  governor_module_loaded && module_loaded=true
+  if [ "${governor}" == "userspace" ]; then
+    failure; echo
+    return 3
+  else
+    if [ -n "$MIN_SPEED" ]; then
+      adjust_cpufreq scaling_min_freq $MIN_SPEED
+    fi
+    if [ -n "$MAX_SPEED" ]; then
+      adjust_cpufreq scaling_max_freq $MAX_SPEED
+    fi
+    if [ -n "$UP_THRESHOLD" -a ${governor} == "ondemand" ]; then
+      adjust_cpufreq ondemand/up_threshold $UP_THRESHOLD
+    fi
+    if [ -n "$DOWN_THRESHOLD" -a ${governor} == "conservative" ]; then
+      adjust_cpufreq conservative/down_threshold $DOWN_THRESHOLD
+    fi
+    if [ "$IGNORE_NICE" -eq 1 -a ${governor} == "ondemand" -o ${governor} == "conservative" ]; then
+      adjust_cpufreq ${governor}/ignore_nice_load $IGNORE_NICE
+    fi
+    echo -n "Reloading configuration for ${governor}: "
+    success; echo
+    return 0
+  fi
+}
+
+case "$1" in
+  start)
+    start
+    ;;
+
+  stop)
+    stop
+    ;;
+
+  status)
+    is_p4_clockmod && p4status="true"
+    if [ "$p4status" == "true" -a "x${GOVERNOR}" == "x" ]; then
+      echo "p4-clockmod passive cooling is enabled"
+      exit 0
+    fi
+    governor_module_loaded && module_loaded=true
+    if [ -d "$xendir" ]; then
+      echo "Frequency scaling not supported under xen kernels"
+      RETVAL=0
+    elif [ $module_loaded == true -o ${governor} == "performance" ]; then
+      echo "Frequency scaling enabled using ${governor} governor"
+      RETVAL=0
+    else
+      status $prog
+      RETVAL="$?"
+    fi
+    ;;
+
+  restart|force-reload)
+    stop
+    start
+    ;;
+
+  reload)
+    reload
+    ;;
+
+  condrestart|try-restart)
+    governor_module_loaded && module_loaded=true
+    if [ $module_loaded == true -o -n "`pidof $prog`" -o ${governor} == "performance" ]; then
+      stop
+      start
+    fi
+    ;;
+
+  *)
+    echo $"Usage: $0 {start|stop|restart|condrestart|status}"
+    exit 2
+    ;;
+esac
+
+exit $RETVAL

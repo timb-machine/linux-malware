@@ -1,0 +1,105 @@
+#!/bin/bash
+# 
+# mdmonitor	This starts, stops, and reloads the mdadm-based
+#		software RAID monitoring and management facility
+#
+# chkconfig: 2345 15 85
+# description: software RAID monitoring and management
+# config: /etc/mdadm.conf
+#
+# Copyright 2002 Red Hat, Inc.
+#
+### BEGIN INIT INFO
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: Start and stop the MD software RAID monitor
+# Description: The mdmonitor service checks the status of all software
+#	RAID arrays on the system.  In the event that any of the arrays
+#	transition into a degraded state, it notifies the system
+#	administrator.  Other options are available, see the mdadm.conf
+#	and mdadm man pages for possible ways to configure this service.
+### END INIT INFO
+
+PIDFILE=/var/run/mdadm/mdadm.pid
+PATH=/sbin:/usr/sbin:$PATH
+RETVAL=0
+OPTIONS="--monitor --scan -f --pid-file=$PIDFILE"
+
+prog=mdmonitor
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+
+usage ()
+{
+    echo "Usage: service $prog {start|stop|status|restart|try-restart|force-reload}"
+    RETVAL=1
+}
+
+
+start ()
+{
+# (Re)start mdmon to take over monitoring of mdmon started from the initrd
+    for i in /dev/md/*.pid; do
+	if [ -r $i ]; then
+            origprog="$prog"; prog="mdmon"
+            action $"Starting $prog: " /sbin/mdmon --takeover --all
+            prog="$origprog"
+	    break
+        fi
+    done
+# Make sure configuration file exists and has information we can use
+# MAILADDR or PROGRAM or both must be set in order to run mdadm --monitor
+    [ -f /etc/mdadm.conf ] || return 6
+    grep '^\(MAILADDR\|PROGRAM\) .' /etc/mdadm.conf >/dev/null 2>&1 || return 6
+    if [ -f "$PIDFILE" ]; then
+	checkpid `cat $PIDFILE` && return 0
+    fi
+    echo -n $"Starting $prog: "
+    cd /
+    daemon --user=root mdadm ${OPTIONS}
+    ret=$?
+    [ $ret -eq "0" ] && touch /var/lock/subsys/$prog
+    echo
+    return $ret
+}
+
+stop ()
+{
+    [ -f /var/lock/subsys/$prog ] || return 0
+    echo -n "Killing $prog: "
+    killproc mdadm
+    echo
+    rm -f $PIDFILE
+    rm -f /var/lock/subsys/$prog
+}
+
+restart ()
+{
+    stop
+    start
+}
+
+condrestart ()
+{
+    [ -e /var/lock/subsys/$prog ] && restart || return 0
+}
+
+
+case "$1" in
+    start|stop|restart|condrestart|try-restart|force-reload)
+    	[ `id -u` != "0" ] && exit 4 ;;
+esac
+
+case "$1" in
+    start) start; RETVAL=$? ;;
+    stop) stop; RETVAL=$? ;;
+    status) status -p $PIDFILE $prog ; RETVAL=$? ;;
+    restart) restart; RETVAL=$? ;;
+    reload) RETVAL=3 ;;
+    condrestart|try-restart|force-reload) condrestart; RETVAL=$? ;;
+    *) usage ; RETVAL=2 ;;
+esac
+
+exit $RETVAL

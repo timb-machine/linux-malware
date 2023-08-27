@@ -1,0 +1,132 @@
+#! /bin/sh
+
+# smartmontools init file for smartd
+# Copyright (C) 2002-4 Bruce Allen <smartmontools-support@lists.sourceforge.net>
+# $Id: smartd.initd,v 1.2 2004/09/17 11:55:28 arjanv Exp $
+
+# For RedHat and cousins:
+# chkconfig: - 99 01
+# description: Self Monitoring and Reporting Technology (SMART) Daemon
+# processname: smartd 
+
+### BEGIN INIT INFO
+# Provides: smartd
+# Required-Start: $local_fs $network
+# Required-Stop: $local_fs $network
+# Should-Start:
+# Default-Start: 
+# Default-Stop: 0 1 2 3 4 5 6
+# Short-Description: Self Monitoring and Reporting Technology (SMART) Daemon
+# Description: The smartd daemon monitors SMART status of the local hard drives and 
+#   provides advanced warnings of of disk degradation or failures.
+### END INIT INFO
+
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; either version 2, or (at your option) any later
+# version. 
+# You should have received a copy of the GNU General Public License (for
+# example COPYING); if not, write to the Free Software Foundation, Inc., 675
+# Mass Ave, Cambridge, MA 02139, USA.
+# This code was originally developed as a Senior Thesis by Michael Cornwell
+# at the Concurrent Systems Laboratory (now part of the Storage Systems
+# Research Center), Jack Baskin School of Engineering, University of
+# California, Santa Cruz. http://ssrc.soe.ucsc.edu/.
+
+# Uncomment the line below to pass options to smartd on startup. 
+# Note that distribution specific configuration files like
+# /etc/{default,sysconfig}/smartmontools might override these
+#smartd_opts="--interval=1800"
+
+SMARTD_BIN=/usr/sbin/smartd
+
+# Source function library
+. /etc/rc.d/init.d/functions
+
+[ -r /etc/sysconfig/smartmontools ] && . /etc/sysconfig/smartmontools
+
+RETVAL=0
+prog=smartd
+pidfile=/var/lock/subsys/smartd
+config=/etc/smartd.conf
+
+start()
+{
+        [ $UID -eq 0 ] || exit 4
+        [ -x $SMARTD_BIN ] || exit 5
+        [ -f $config ] || exit 6
+	echo -n $"Starting $prog: "
+	daemon $SMARTD_BIN $smartd_opts
+	RETVAL=$?
+	echo
+	[ $RETVAL = 0 ] && touch $pidfile
+	return $RETVAL
+}
+
+stop()
+{
+        [ $UID -eq 0 ] || exit 4
+	echo -n $"Shutting down $prog: "
+	killproc $SMARTD_BIN
+	RETVAL=$?
+	echo
+	rm -f $pidfile
+	return $RETVAL
+}
+
+reload()
+{
+	echo -n $"Reloading $prog daemon configuration: "
+	killproc $SMARTD_BIN -HUP
+	RETVAL=$?
+	echo
+	return $RETVAL
+}
+
+report()
+{
+	echo -n $"Checking SMART devices now: "
+	killproc $SMARTD_BIN -USR1
+	RETVAL=$?
+	echo
+	return $RETVAL
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	reload)
+		reload
+		;;
+	report)
+		report
+		;;
+	restart)
+		stop
+		start
+		;;
+	condrestart|try-restart)
+		if [ -f $pidfile ]; then
+			stop
+			start
+		fi
+		;;
+	force-reload)
+		reload || (stop; start)
+		;;
+	status)
+		status $prog
+		RETVAL=$?
+		;;
+	*)
+		echo $"Usage: $0 {start|stop|restart|status|condrestart|try-restart|reload|force-reload|report}"
+		RETVAL=2
+		[ "$1" = 'usage' ] && RETVAL=0
+esac
+
+exit $RETVAL
+

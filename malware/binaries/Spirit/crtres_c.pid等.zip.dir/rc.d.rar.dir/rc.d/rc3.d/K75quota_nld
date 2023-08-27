@@ -1,0 +1,104 @@
+#!/bin/sh
+#
+# quota_nld     Disk quota netlink message daemon
+#
+# chkconfig:   - 25 75
+# description:  quota_nld is a deamon that listens on netlink socket and \
+#               passes disk quota warnings produced by kernel to system \
+#               D-Bus or terminal user has last accessed.
+
+### BEGIN INIT INFO
+# Provides: quota_nld 
+# Required-Start: $local_fs
+# Should-Start: $syslog messagebus 
+# Should-Stop: $syslog messagebus
+# Short-Description: Disk quota netlink message daemon
+# Description:  quota_nld is a deamon that listens on netlink socket and \
+#               passes disk quota warnings produced by kernel to system \
+#               D-Bus or terminal user has last accessed.
+### END INIT INFO
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+exec="/usr/sbin/quota_nld"
+prog="quota_nld"
+
+[ -e /etc/sysconfig/$prog ] && . /etc/sysconfig/$prog
+
+lockfile=/var/lock/subsys/$prog
+
+start() {
+    [ "$(id -u)" -eq 0 ] || exit 4
+    [ -x $exec ] || exit 5
+    echo -n $"Starting $prog: "
+    daemon $exec $QUOTA_NLD_OPTS
+    retval=$?
+    echo
+    [ $retval -eq 0 ] && touch $lockfile
+    return $retval
+}
+
+stop() {
+    [ "$(id -u)" -eq 0 ] || exit 4
+    echo -n $"Stopping $prog: "
+    killproc $prog
+    retval=$?
+    echo
+    [ $retval -eq 0 ] && rm -f $lockfile
+    return $retval
+}
+
+restart() {
+    stop
+    start
+}
+
+reload() {
+    restart
+}
+
+force_reload() {
+    restart
+}
+
+rh_status() {
+    status $prog
+}
+
+rh_status_q() {
+    rh_status >/dev/null 2>&1
+}
+
+
+case "$1" in
+    start)
+        rh_status_q && exit 0
+        $1
+        ;;
+    stop)
+        rh_status_q || exit 0
+        $1
+        ;;
+    restart)
+        $1
+        ;;
+    reload)
+        rh_status_q || exit 7
+        $1
+        ;;
+    force-reload)
+        force_reload
+        ;;
+    status)
+        rh_status
+        ;;
+    condrestart|try-restart)
+        rh_status_q || exit 0
+        restart
+        ;;
+    *)
+        echo $"Usage: $0 {start|stop|status|restart|condrestart|try-restart|reload|force-reload}"
+        exit 2
+esac
+exit $?

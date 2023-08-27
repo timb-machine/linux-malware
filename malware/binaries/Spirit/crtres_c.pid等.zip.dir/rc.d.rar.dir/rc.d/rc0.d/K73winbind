@@ -1,0 +1,102 @@
+#!/bin/sh
+#
+# chkconfig: - 24 73
+# description: Starts and stops the Samba winbind daemon
+#	       #
+# pidfile: /var/run/winbindd.pid
+# config:  /etc/samba/smb.conf
+
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+# Avoid using root's TMPDIR
+unset TMPDIR
+
+# Source networking configuration.
+. /etc/sysconfig/network
+
+# Check that networking is up.
+[ ${NETWORKING} = "no" ] && exit 1
+
+# Check that smb.conf exists.
+[ -f /etc/samba/smb.conf ] || exit 6
+
+[ -f /etc/sysconfig/samba ] && . /etc/sysconfig/samba
+
+RETVAL=0
+
+
+start() {
+        KIND="Winbind"
+	echo -n $"Starting $KIND services: "
+	daemon winbindd "$WINBINDOPTIONS"
+	RETVAL=$?
+	echo
+	[ $RETVAL -eq 0 ] && touch /var/lock/subsys/winbindd || RETVAL=1
+	return $RETVAL
+}	
+
+stop() {
+        echo
+	KIND="Winbind"
+	echo -n $"Shutting down $KIND services: "
+	killproc winbindd
+	RETVAL=$?
+	[ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/winbindd
+	echo ""
+	return $RETVAL
+}	
+
+restart() {
+	stop
+	start
+}	
+
+reload() {
+        echo -n $"Reloading smb.conf file: "
+	killproc winbindd -HUP
+	RETVAL=$?
+	echo
+	return $RETVAL
+}	
+
+rhstatus() {
+	status winbindd
+	return $?
+}	
+
+# Allow status as non-root.
+if [ "$1" = status ]; then
+       rhstatus
+       exit $?
+fi
+
+# Check that we can write to it... so non-root users stop here
+[ -w /etc/samba/smb.conf ] || exit 4
+
+case "$1" in
+  start)
+  	start
+	;;
+  stop)
+  	stop
+	;;
+  restart)
+  	restart
+	;;
+  reload)
+  	reload
+	;;
+  status)
+  	rhstatus
+	;;
+  condrestart)
+  	[ -f /var/lock/subsys/winbindd ] && restart || :
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|restart|reload|status|condrestart}"
+	exit 2
+esac
+
+exit $?

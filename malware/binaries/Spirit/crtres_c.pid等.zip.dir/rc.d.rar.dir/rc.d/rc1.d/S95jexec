@@ -1,0 +1,394 @@
+#!/bin/sh
+#
+# Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+# ORACLE PROPRIETARY/CONFIDENTIAL. Use is subject to license terms.
+#
+#
+# A script for supporting the direct execution of binary formats through
+# binfmt_misc.
+#
+# More information about binfmt_misc is available at the binfmt_misc homepage:
+#
+#     http://www.tat.physik.uni-tuebingen.de/~rguenth/linux/binfmt_misc.html
+#
+#
+### BEGIN INIT INFO
+# Provides: binfmt_misc
+# Required-Start: $local_fs
+# Default-Start: 1 2 3 4 5
+# Default-Start: 0 6
+# chkconfig: 12345 95 05
+# Description: Supports the direct execution of binary formats.
+### END INIT INFO
+#
+
+BINFMT_MISC=/proc/sys/fs/binfmt_misc
+JEXEC=/usr/java/default/lib/jexec
+PKMAGIC="PK\x03\x04"
+PKMAGICHEX="504b0304"
+NAME=jexec
+TYPE=M
+OFFSET=
+MAGIC=${PKMAGIC}
+MASK=
+INTERP=${JEXEC}
+
+ENABLED=enabled
+DISABLED=disabled
+
+
+#
+# LSB compliant error values
+SUCCESS=0
+UNSPECIFIED=1
+INVALID_ARGUMENT=2
+ARG_NOT_SUPPORTED=3
+INSUFFICIENT_PRIVILEGE=4
+NO_BINFMT_MISC_SUPPORT=5
+FAILED_TO_ENABLE=7
+SERVICE_ENABLED=${SUCCESS}
+SERVICE_DISABLED=151
+SERVICE_NOT_MOUNTED=152
+REGISTERED_ENABLED=153
+REGISTERED_DISABLED=154
+NOT_REGISTERED=155
+MAGIC_IN_USE=156
+
+
+#
+# LSB compliant status values
+STATUS_RUNNING=0
+STATUS_NOT_RUNNING=3
+
+#
+# Checks that the binfmt_misc service is mounted and enabled.
+#
+# Output:
+#    This function writes the return value to stdout.
+#
+# Returns:
+#     0   : the service is mounted and enabled.
+#     151 : the service is mounted but disabled.
+#     152 : the binfmt_misc service is not mounted.
+#
+check_binfmt_misc() {
+    result=${SERVICE_NOT_MOUNTED}
+
+    if [ -e ${BINFMT_MISC}/register ] && [ -e ${BINFMT_MISC}/status ]; then
+        if [ "`cat ${BINFMT_MISC}/status`" = "enabled" ]; then
+            result=${SERVICE_ENABLED}
+        else
+            result=${SERVICE_DISABLED}
+        fi
+    fi
+
+    echo ${result}
+}
+
+
+#
+# Mounts the service for use.  If binfmt_misc is not already mounted, this
+# function will attempt to mount it, creating the /proc subdirs if necessary.
+#
+# Output:
+#    This function writes the return value to stdout.
+#
+# Returns:
+#     0   : Success.
+#     4   : insufficient privileges to create the mount point.
+#     5   : the binfmt_misc service is not supported.
+#
+mount_service() {
+    result=${NO_BINFMT_MISC_SUPPORT}
+
+    if [ ! -e ${BINFMT_MISC}/register ] || [ ! -e ${BINFMT_MISC}/status ]; then
+        mkdir -p ${BINFMT_MISC} 2> /dev/null
+        if [ -d ${BINFMT_MISC} ]; then
+            mount -t binfmt_misc none ${BINFMT_MISC} 2> /dev/null
+        else
+            result=${INSUFFICIENT_PRIVILEGE}
+        fi
+    fi
+
+    if [ -e ${BINFMT_MISC}/register ] && [ -e ${BINFMT_MISC}/status ]; then
+        result=${SUCCESS}
+    fi
+
+    echo ${result}
+}
+
+
+#
+# Registers the jexec interpreter with the PK-ZIP binary type.  This function
+# first checks to see if any other interpreter is registered and enabled for
+# the PK-ZIP binary type.  If nothing else is currently enabled for the PK-ZIP
+# binary type then the jexec entry is created.  If the jexec entry exists, but
+# is disabled, then it is enabled.
+#
+# Output:
+#    This function writes the return value to stdout.
+#
+# Returns:
+#     0   : Success.
+#     4   : insufficient privileges to enable the jexec interpreter.
+#     156 : another interpreter is registered for the PK-ZIP binary type.
+#
+# Note: once the PK-ZIP magic number is detected, the jexec interpreter handles
+#       all additional processing required to determine if the file is a JAR or
+#       just a simple ZIP file.
+#
+register_jexec() {
+    result=${SUCCESS}
+
+    # first make sure that nothing else has registered the PK-ZIP magic
+    for file in ${BINFMT_MISC}/*; do
+        filename="`basename ${file}`"
+        if [ "${filename}" != "register" ] &&
+           [ "${filename}" != "status" ]
+        then
+            is_registered=`check_registration ${file}`
+            if [ ${is_registered} -eq ${REGISTERED_ENABLED} ] &&
+               [ "${filename}" != "${NAME}" ]
+            then
+                result=${MAGIC_IN_USE}
+            elif [ ${is_registered} -eq ${REGISTERED_DISABLED} ] &&
+                 [ "${filename}" = "${NAME}" ]
+            then
+                # the registration exists, but is disabled, so re-enable it
+                enable_jexec 2> /dev/null
+                if [ $? -ne 0 ]; then
+                    result=${INSUFFICIENT_PRIVILEGE}
+                fi
+            fi
+        fi
+    done
+
+    if [ ${result} -eq ${SUCCESS} ] &&
+       [ ! -e ${BINFMT_MISC}/${NAME} ]
+    then
+        # Register jexec with the PK-ZIP magic number.  jexec does additional
+        # decoding of the ZIP/JAR file header to determine if it is actually
+        # a JAR file, or just a regular ZIP file.
+        echo ":${NAME}:${TYPE}:${OFFSET}:${MAGIC}:${MASK}:${INTERP}:" > \
+            ${BINFMT_MISC}/register
+        if [ ! -e ${BINFMT_MISC}/${NAME} ]; then
+            result=${INSUFFICIENT_PRIVILEGE}
+        fi
+    fi
+
+    echo ${result}
+}
+
+
+#
+# Unregisters the jexec interpreter with the PK-ZIP binary type.
+#
+# This function is just a wrapper that allows any error messages to be sent to
+# /dev/null.  Generally speaking this function shouldn't fail unless the user
+# doesn't have sufficient permission to write to binfmt_misc.
+#
+unregister_jexec() {
+    echo -1 > ${BINFMT_MISC}/${NAME}
+    return $?
+}
+
+
+#
+# Sets the overall binfmt_misc status.
+#
+# This function is just a wrapper that allows any error messages to be sent to
+# /dev/null.  Generally speaking this function shouldn't fail unless the user
+# doesn't have sufficient permission to write to binfmt_misc.
+#
+# Parameters:
+#     $1 : overall status to set; either 1 = enable, 0 = disable, -1 = remove
+#
+set_service_status() {
+    echo $1 > ${BINFMT_MISC}/status
+    return $?
+}
+
+
+#
+# Enable the jexec interpreter.
+#
+# This function is just a wrapper that allows any error messages to be sent to
+# /dev/null.  Generally speaking this function shouldn't fail unless the user
+# doesn't have sufficient permission to write to binfmt_misc.
+#
+enable_jexec() {
+    echo 1 > ${BINFMT_MISC}/${NAME}
+    return $?
+}
+
+
+#
+# This function checks if a given registration contains the PK-ZIP magic number,
+# and if it does, is it enabled.
+#
+# Parameters:
+#     $1 : file - the full pathname to the registration to check
+#
+check_registration() {
+    file="$1"
+    result=${NOT_REGISTERED}
+
+    if [ -n "`grep \"magic ${PKMAGICHEX}\" ${file}`" ]; then
+        result=${REGISTERED_DISABLED}
+        if [ -n "`grep \"${ENABLED}\" ${file}`" ]; then
+            result=${REGISTERED_ENABLED}
+        fi
+    fi
+
+    echo ${result}
+}
+
+
+#
+# Starts the jexec service.  The service is started if all of the following
+# conditions are met:
+#
+#     * the service is properly mounted
+#     * the jexec binary interperter is registered and enabled
+#     * the service is enabled
+#
+# Output:
+#    This function writes the return value to stdout.
+#
+# Returns:
+#     0   : Success.
+#     4   : insufficient privileges.
+#     5   : the binfmt_misc service is not supported.
+#     151 : the service is mounted but disabled.
+#     152 : the binfmt_misc service is not mounted.
+#     156 : another interpreter is registered for the PK-ZIP binary type.
+#
+start() {
+    # make sure binfmt_misc is mounted
+    result=`mount_service`
+    if [ ${result} -eq ${SUCCESS} ]; then
+        # make sure jexec is registered and enabled
+        result=`register_jexec`
+        if [ ${result} -eq ${SUCCESS} ] &&
+           [ "`cat ${BINFMT_MISC}/status`" != "${ENABLED}" ]
+        then
+            # enable binfmt_misc
+            set_service_status 1 2> /dev/null
+            if [ $? -ne 0 ]; then
+                result=${INSUFFICIENT_PRIVILEGE}
+            else
+                result=`check_binfmt_misc`
+            fi
+        fi
+    fi
+
+    echo ${result}
+}
+
+
+#
+# Don't bother stopping anything other than the actual jexec interpreter.
+#
+# Output:
+#    This function writes the return value to stdout.
+#
+# Returns:
+#     0   : Success.
+#     4   : insufficient privileges.
+#
+stop() {
+    result=${SUCCESS}
+
+    if [ -e ${BINFMT_MISC}/${NAME} ]; then
+        status=`check_registration ${BINFMT_MISC}/${NAME}`
+        if [ ${status} -eq ${REGISTERED_ENABLED} ]; then
+            unregister_jexec 2> /dev/null
+            if [ $? -ne 0 ]; then
+                result=${INSUFFICIENT_PRIVILEGE}
+            fi
+        fi
+    fi
+
+    echo ${result}
+}
+
+
+#
+# Get the current status of the service.
+#
+# Output:
+#    This function writes the return value to stdout.
+#
+# Returns:
+#     0   : The jexec interpreter is fully setup to handle JAR file execution.
+#     3   : The jexec interpreter is not setup.
+#
+status() {
+    status=`check_binfmt_misc`
+    result=${STATUS_RUNNING}
+
+    if [ ${status} -eq ${SERVICE_ENABLED} ] &&
+       [ -e ${BINFMT_MISC}/${NAME} ]
+    then
+        status=`check_registration ${BINFMT_MISC}/${NAME}`
+        if [ ${status} -ne ${REGISTERED_ENABLED} ]; then
+            result=${STATUS_NOT_RUNNING}
+        fi
+    else
+        result=${STATUS_NOT_RUNNING}
+    fi
+
+    echo ${result}
+}
+
+STATUS=0
+
+case "$1" in
+    start)
+        echo -n "Starting jexec services"
+        STATUS=`start`
+        ;;
+
+    stop)
+        echo -n "Stopping jexec services"
+        STATUS=`stop`
+        ;;
+
+    try-restart | condrestart | force-reload)
+        $0 status
+        STATUS=$?
+        if [ ${STATUS} -eq 0 ]; then
+            $0 restart
+            STATUS=$?
+        else
+            # Not running is not a failure
+            STATUS=${SUCCESS}
+        fi
+        ;;
+
+    restart)
+        $0 stop
+        $0 start
+        STATUS=$?
+        ;;
+
+    status)
+        echo -n "Checking jexec status"
+        STATUS=`status`
+        ;;
+
+    reload)
+        STATUS=${ARG_NOT_SUPPORTED}
+        ;;
+
+    probe)
+        STATUS=${ARG_NOT_SUPPORTED}
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|status|try-restart|restart|force-reload}"
+        STATUS=${INVALID_ARGUMENT}
+        ;;
+esac
+
+exit $STATUS

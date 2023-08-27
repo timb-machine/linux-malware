@@ -1,0 +1,234 @@
+#!/bin/bash
+#
+# sshd		Start up the OpenSSH server daemon
+#
+# chkconfig: 2345 55 25
+# description: SSH is a protocol for secure remote shell access. \
+#              This service starts up the OpenSSH server daemon.
+#
+# processname: sshd
+# config: /etc/ssh/ssh_host_key
+# config: /etc/ssh/ssh_host_key.pub
+# config: /etc/ssh/ssh_random_seed
+# config: /etc/ssh/sshd_config
+# pidfile: /var/run/sshd.pid
+
+### BEGIN INIT INFO
+# Provides: sshd
+# Required-Start: $local_fs $network $syslog
+# Required-Stop: $local_fs $syslog
+# Should-Start: $syslog
+# Should-Stop: $network $syslog
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: Start up the OpenSSH server daemon
+# Description:       SSH is a protocol for secure remote shell access.
+#		     This service starts up the OpenSSH server daemon.
+### END INIT INFO
+
+# source function library
+. /etc/rc.d/init.d/functions
+
+# pull in sysconfig settings
+[ -f /etc/sysconfig/sshd ] && . /etc/sysconfig/sshd
+
+RETVAL=0
+prog="sshd"
+lockfile=/var/lock/subsys/$prog
+
+# Some functions to make the below more readable
+KEYGEN=/usr/bin/ssh-keygen
+SSHD=/usr/sbin/sshd
+RSA1_KEY=/etc/ssh/ssh_host_key
+RSA_KEY=/etc/ssh/ssh_host_rsa_key
+DSA_KEY=/etc/ssh/ssh_host_dsa_key
+PID_FILE=/var/run/sshd.pid
+
+runlevel=$(set -- $(runlevel); eval "echo \$$#" )
+
+fips_enabled() {
+	if [ -r /proc/sys/crypto/fips_enabled ]; then
+		cat /proc/sys/crypto/fips_enabled
+	else
+		echo 0
+	fi
+}
+
+do_rsa1_keygen() {
+	if [ ! -s $RSA1_KEY -a `fips_enabled` -eq 0 ]; then
+		echo -n $"Generating SSH1 RSA host key: "
+		rm -f $RSA1_KEY
+		if test ! -f $RSA1_KEY && $KEYGEN -q -t rsa1 -f $RSA1_KEY -C '' -N '' >&/dev/null; then
+			chmod 600 $RSA1_KEY
+			chmod 644 $RSA1_KEY.pub
+			if [ -x /sbin/restorecon ]; then
+			    /sbin/restorecon $RSA1_KEY.pub
+			fi
+			success $"RSA1 key generation"
+			echo
+		else
+			failure $"RSA1 key generation"
+			echo
+			exit 1
+		fi
+	fi
+}
+
+do_rsa_keygen() {
+	if [ ! -s $RSA_KEY ]; then
+		echo -n $"Generating SSH2 RSA host key: "
+		rm -f $RSA_KEY
+		if test ! -f $RSA_KEY && $KEYGEN -q -t rsa -f $RSA_KEY -C '' -N '' >&/dev/null; then
+			chmod 600 $RSA_KEY
+			chmod 644 $RSA_KEY.pub
+			if [ -x /sbin/restorecon ]; then
+			    /sbin/restorecon $RSA_KEY.pub
+			fi
+			success $"RSA key generation"
+			echo
+		else
+			failure $"RSA key generation"
+			echo
+			exit 1
+		fi
+	fi
+}
+
+do_dsa_keygen() {
+	if [ ! -s $DSA_KEY ]; then
+		echo -n $"Generating SSH2 DSA host key: "
+		rm -f $DSA_KEY
+		if test ! -f $DSA_KEY && $KEYGEN -q -t dsa -f $DSA_KEY -C '' -N '' >&/dev/null; then
+			chmod 600 $DSA_KEY
+			chmod 644 $DSA_KEY.pub
+			if [ -x /sbin/restorecon ]; then
+			    /sbin/restorecon $DSA_KEY.pub
+			fi
+			success $"DSA key generation"
+			echo
+		else
+			failure $"DSA key generation"
+			echo
+			exit 1
+		fi
+	fi
+}
+
+do_restart_sanity_check()
+{
+	$SSHD -t
+	RETVAL=$?
+	if [ $RETVAL -ne  0 ]; then
+		failure $"Configuration file or keys are invalid"
+		echo
+	fi
+}
+
+start()
+{
+	[ -x $SSHD ] || exit 5
+	[ -f /etc/ssh/sshd_config ] || exit 6
+	# Create keys if necessary
+	if [ "x${AUTOCREATE_SERVER_KEYS}" != xNO ]; then
+		do_rsa1_keygen
+		do_rsa_keygen
+		do_dsa_keygen
+	fi
+
+	echo -n $"Starting $prog: "
+	$SSHD $OPTIONS && success || failure
+	RETVAL=$?
+	[ $RETVAL -eq 0 ] && touch $lockfile
+	echo
+	return $RETVAL
+}
+
+stop()
+{
+	echo -n $"Stopping $prog: "
+	killproc -p $PID_FILE $SSHD
+	RETVAL=$?
+	# if we are in halt or reboot runlevel kill all running sessions
+	# so the TCP connections are closed cleanly
+	if [ "x$runlevel" = x0 -o "x$runlevel" = x6 ] ; then
+	    trap '' TERM
+	    killall $prog 2>/dev/null
+	    trap TERM
+	fi
+	[ $RETVAL -eq 0 ] && rm -f $lockfile
+	echo
+}
+
+reload()
+{
+	echo -n $"Reloading $prog: "
+	killproc -p $PID_FILE $SSHD -HUP
+	RETVAL=$?
+	echo
+}
+
+restart() {
+	stop
+	start
+}
+
+force_reload() {
+	restart
+}
+
+rh_status() {
+	status -p $PID_FILE openssh-daemon
+}
+
+rh_status_q() {
+	rh_status >/dev/null 2>&1
+}
+
+case "$1" in
+	start)
+		rh_status_q && exit 0
+		start
+		;;
+	stop)
+		if ! rh_status_q; then
+			rm -f $lockfile
+			exit 0
+		fi
+		stop
+		;;
+	restart)
+		restart
+		;;
+	reload)
+		rh_status_q || exit 7
+		reload
+		;;
+	force-reload)
+		force_reload
+		;;
+	condrestart|try-restart)
+		rh_status_q || exit 0
+		if [ -f $lockfile ] ; then
+			do_restart_sanity_check
+			if [ $RETVAL -eq 0 ] ; then
+				stop
+				# avoid race
+				sleep 3
+				start
+			else
+				RETVAL=6
+			fi
+		fi
+		;;
+	status)
+		rh_status
+		RETVAL=$?
+		if [ $RETVAL -eq 3 -a -f $lockfile ] ; then
+			RETVAL=2
+		fi
+		;;
+	*)
+		echo $"Usage: $0 {start|stop|restart|reload|force-reload|condrestart|try-restart|status}"
+		RETVAL=2
+esac
+exit $RETVAL

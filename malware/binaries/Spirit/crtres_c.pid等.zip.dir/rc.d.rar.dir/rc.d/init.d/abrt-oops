@@ -1,0 +1,91 @@
+#!/bin/bash
+# Start ABRT kernel log watcher
+#
+# chkconfig: 35 82 16
+# description: Watches system log for oops messages, creates ABRT dump directories for each oops
+### BEGIN INIT INFO
+# Provides: abrt-oops
+# Required-Start: $abrtd
+# Default-Stop: 0 1 2 6
+# Default-Start: 3 5
+# Short-Description: Watches system log for oops messages, creates ABRT dump directories for each oops
+# Description: Watches system log for oops messages, creates ABRT dump directories for each oops
+### END INIT INFO
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+# For debugging
+dry_run=false
+verbose=false
+
+# We don't have pid files, therefore have to use
+# a flag file in /var/lock/subsys to enable GUI service tools
+# to figure out our status
+LOCK="/var/lock/subsys/abrt-oops"
+
+RETVAL=0
+
+check() {
+	# Check that we're a privileged user
+	[ "`id -u`" = 0 ] || exit 4
+}
+
+start() {
+	check
+	killall abrt-dump-oops 2>/dev/null
+	setsid abrt-dump-oops -d /var/spool/abrt -rwx /var/log/messages </dev/null >/dev/null 2>&1 &
+	$dry_run || touch -- "$LOCK"
+	return $RETVAL
+}
+
+stop() {
+	check
+	killall abrt-dump-oops
+	$dry_run || rm -f -- "$LOCK"
+	return $RETVAL
+}
+
+restart() {
+	stop
+	start
+}
+
+reload() {
+	restart
+}
+
+case "$1" in
+start)
+	start
+	;;
+stop)
+	stop
+	;;
+reload)
+	reload
+	;;
+force-reload)
+	echo "$0: Unimplemented feature."
+	RETVAL=3
+	;;
+restart)
+	restart
+	;;
+condrestart)
+	# Is it already running?
+	if test -f "$LOCK"; then   # yes
+		$verbose && printf "Running, restarting\n"
+		restart
+	fi
+	;;
+status)
+	status abrt-dump-oops
+	RETVAL=$?
+	;;
+*)
+	echo $"Usage: $0 {start|stop|status|restart|condrestart|reload|force-reload}"
+	RETVAL=2
+esac
+
+exit $RETVAL

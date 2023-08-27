@@ -1,0 +1,113 @@
+#!/bin/bash
+#
+# rpcgssd       Start up and shut down RPCSEC GSS daemon
+#
+# chkconfig: 345 19 85
+# description: Starts user-level daemon that manages RPCSEC GSS contexts \
+#	       for the NFS client.
+
+### BEGIN INIT INFO
+# Provides: rpcgssd
+# Required-Start: $network $syslog
+# Required-Stop: $network $syslog
+# Default-Start: 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: Starts the RPCSEC GSS client daemon
+# Description: NFS is a popular protocol for file sharing across \
+#          networks. This deamon manages RPCSEC GSS contexts on the
+#          client used by secure NFS mounts
+### END INIT INFO
+
+# Source function library.
+. /etc/init.d/functions
+
+# Source networking configuration.
+[ -f /etc/sysconfig/network ]&&  . /etc/sysconfig/network
+
+# Check for and source configuration file otherwise set defaults
+[ -f /etc/sysconfig/nfs ] && . /etc/sysconfig/nfs
+
+# Try to use machine credentials by default
+RETVAL=0
+uid=`id | cut -d\( -f1 | cut -d= -f2`
+
+prog="rpc.gssd"
+LOCKFILE=/var/lock/subsys/$prog
+
+case "$1" in
+  start|condstart)
+	# Check that networking is up.
+	[ "${NETWORKING}" != "yes" ] && exit 6
+	[ ! -x /usr/sbin/rpc.gssd ] && exit 5
+	# Only root can start the service
+	[ $uid -ne 0 ] && exit 4
+
+	# Make sure the daemon is not already running.
+	if status $prog > /dev/null ; then
+		exit 0
+	fi
+
+	# During condstart need to check again to see 
+	# if we are configured to start
+	[ "${SECURE_NFS}" != "yes" ] && exit 6
+
+	rm -f $LOCKFILE
+	echo -n $"Starting RPC gssd: "
+
+	# Make sure the rpc_pipefs filesystem is available
+	/bin/mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs > /dev/null 2>&1
+
+	[ -x /sbin/lsmod -a -x /sbin/modprobe ] && {
+		if ! /sbin/lsmod | grep rpcsec_gss_krb5 > /dev/null ;  then
+			/sbin/modprobe rpcsec_gss_krb5 || {
+				echo "Error: Unable to load rpcsec_gss_krb5."
+				exit 6;
+			}
+		fi
+	}
+
+	# Start daemon.
+	daemon $prog ${RPCGSSDARGS}
+	RETVAL=$?
+	echo
+	[ $RETVAL -eq 0 ] && touch $LOCKFILE
+	;;
+  stop)
+	# Only root can stop the service
+	[ $uid -ne 0 ] && exit 4
+
+	# Stop daemon.
+	echo -n $"Stopping RPC gssd: "
+	killproc $prog
+	RETVAL=$?
+	echo
+	rm -f $LOCKFILE
+	;;
+  status)
+	status rpc.gssd
+	RETVAL=$?
+	;;
+  restart|reload|force-reload)
+	$0 stop
+	$0 start
+	RETVAL=$?
+	;;
+  condrestart|try-restart)
+	if [ -f $LOCKFILE ]; then
+		$0 restart
+		RETVAL=$?
+	fi
+	;;
+  condstop)
+	if [ -f $LOCKFILE ]; then
+		$0 stop
+		RETVAL=$?
+	fi
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|restart|force-reload|condstart|condrestart|try-restart|status|condstop}"
+	RETVAL=2
+	;;
+esac
+
+exit $RETVAL

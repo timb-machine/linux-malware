@@ -1,0 +1,91 @@
+#!/bin/bash
+#
+# $Id$
+#
+### BEGIN INIT INFO
+# Provides: rdisc
+# Short-Description: This is a daemon which discovers routers on the local subnet.
+# Description: This is a daemon which discovers routers on the local subnet.
+### END INIT INFO
+
+# chkconfig: - 41 89
+# config: /etc/sysconfig/rdisc
+
+# Source function library.
+. /etc/init.d/functions
+. /etc/sysconfig/network
+
+#
+# Set default options.  Override the defaults and define 
+# custom options in /etc/sysconfig/rdisc
+#
+RDISCOPTS="-s"
+LOCKFILE=/var/lock/subsys/rdisc
+
+[ -f /etc/sysconfig/rdisc ] && . /etc/sysconfig/rdisc
+
+
+start() {
+	# Check that networking is configured.
+	[ ${NETWORKING} = "no" ] && exit 1
+
+	echo -n $"Starting router discovery: "
+	if [ $UID -ne 0 ]; then
+                RETVAL=4
+                failure
+        else
+		daemon /sbin/rdisc $RDISCOPTS
+		RETVAL=$?
+		[ $RETVAL -eq 0 ] && touch $LOCKFILE
+	fi;
+	echo
+	return $RETVAL
+}
+
+stop() {
+	echo -n $"Shutting down router discovery services: "
+	if [ $UID -ne 0 ]; then
+                RETVAL=4
+                failure
+        else
+        	killproc /sbin/rdisc
+		RETVAL=$?
+	        [ $RETVAL -eq 0 ] && rm -f $LOCKFILE
+        fi;
+	echo
+	return $RETVAL
+}
+
+restart() {
+	stop
+	start
+}
+
+RETVAL=0
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  status)
+	status rdisc
+	;;
+  restart|reload)
+	restart
+	;;
+  condrestart)
+	if status $prog > /dev/null; then
+	    stop
+	    start
+	fi
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|status|restart|reload}"
+	exit 2
+esac
+
+exit $?

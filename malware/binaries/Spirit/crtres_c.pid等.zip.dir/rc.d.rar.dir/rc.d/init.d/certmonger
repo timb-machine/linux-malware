@@ -1,0 +1,102 @@
+#!/bin/sh
+#
+# certmonger monitors certificates for impending expiration and can
+# attempt to re-enroll when they expire
+#
+# chkconfig: 345 99 01 
+# description: Provides certificate monitoring and PKI enrollment.
+# processname: /usr/sbin/certmonger
+# pidfile: /var/run/certmonger.pid
+#
+
+### BEGIN INIT INFO
+# Provides: certmonger
+# Required-Start: messagebus
+# Required-Stop: messagebus
+# Should-Start: $network
+# Should-Stop: $network
+# Short-Description: Certificate monitor and PKI enrollment client
+# Description: Provides certificate monitoring and PKI enrollment.
+### END INIT INFO
+
+program=/usr/sbin/certmonger
+prog=${program##*/}
+pidfile=/var/run/certmonger.pid
+lockfile=/var/lock/subsys/certmonger
+
+if [ -f /etc/rc.d/init.d/functions ]; then
+        . /etc/rc.d/init.d/functions
+fi
+if [ -f /etc/sysconfig/certmonger ]; then
+        . /etc/sysconfig/certmonger
+fi
+
+RETVAL=0
+
+start() {
+    echo -n $"Starting $prog: "
+    [ -x $program ] || exit 5
+    daemon $program -S -p ${pidfile} $OPTS
+    RETVAL=$?
+    echo
+    [ $RETVAL -eq 0 ] && touch $lockfile
+    return $RETVAL
+}
+
+stop() {
+    echo -n $"Stopping $prog: "
+    killproc $program
+    RETVAL=$?
+    echo
+    if [ $RETVAL -eq 0 ]; then
+        rm -f $lockfile
+    fi
+}
+
+mystatusq() {
+    status $program > /dev/null 2> /dev/null
+}
+
+restart() {
+    stop
+    start
+}
+
+# See how we were called.
+case "$1" in
+    start)
+        if mystatusq ; then
+            touch $lockfile
+            exit 0
+        fi
+        $1
+        ;;
+    stop)
+        if ! test -f $pidfile ; then
+            mystatusq || exit 0
+        fi
+        $1
+        ;;
+    restart)
+        $1
+        ;;
+    status)
+        status -p $pidfile $program
+        RETVAL=$?
+        ;;
+    condrestart|try-restart)
+        [ -f $lockfile ] && restart || :
+        ;;
+    reload)
+        echo "can't reload configuration, you have to restart it"
+        RETVAL=3
+        ;;
+    force-reload)
+        restart
+        ;;
+    *)
+        echo $"Usage: $0 {start|stop|status|restart|condrestart|try-restart|reload|force-reload}"
+        exit 2
+        ;;
+esac
+exit $RETVAL

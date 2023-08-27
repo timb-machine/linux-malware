@@ -1,0 +1,96 @@
+#!/bin/bash
+#
+# udev-post     Post script for udev, after all filesystems are mounted
+#
+# Authors:      Harald Hoyer <harald@redhat.com>
+#
+# chkconfig: 12345 26 75
+# description: Moves the generated persistent udev rules to /etc/udev/rules.d
+# 
+### BEGIN INIT INFO
+# Default-Start: 12345
+# Default-Stop:  0 6
+# Required-Start: $local_fs
+# Required-Stop: 
+# Short-Description: Moves the generated persistent udev rules to /etc/udev/rules.d
+# Description: Moves the generated persistent udev rules to /etc/udev/rules.d
+# Provides: udev-post
+### END INIT INFO
+
+. /etc/rc.d/init.d/functions
+. /etc/sysconfig/udev
+
+# See how we were called.
+case "$1" in
+  start|reload)
+	[ -w /var/lock/subsys ] || exit 4
+	STRING=$"Retrigger failed udev events"
+	echo -n $STRING 
+	/sbin/udevadm trigger --type=failed
+	success "$STRING"
+	echo
+
+	STRING=$"Adding udev persistent rules"
+	
+	# copy the rules generated before / was mounted read-write
+	for file in /dev/.udev/tmp-rules--*; do
+		dest=${file##*tmp-rules--}
+		# check, if anything is todo
+		[ "$dest" = '*' ] && exit 0
+		echo -n $STRING 
+		cat $file >> /etc/udev/rules.d/$dest
+		rc=$(($rc+$?))
+		rm -f $file
+	done
+	if [ "$rc" -eq "0" ]; then
+		success "$STRING"
+		echo
+	elif [ "$rc" -eq "1" ]; then
+		failure "$STRING"
+		echo
+        fi
+
+	touch /var/lock/subsys/udev-post
+	exit 0
+	;;
+  stop)
+	[ -w /var/lock/subsys ] || exit 4
+	STRING=$"Generating udev makedev cache file"	
+	MAKEDEV="/sbin/MAKEDEV"
+	USE_MD5="false"
+	[ -x /usr/bin/md5sum -a "$UDEV_USE_MAKEDEV_CACHE" == "yes" ] && USE_MD5="true"
+	if [ "$USE_MD5" == "true" -a -x "$MAKEDEV" ]; then
+		for i in /etc/udev/makedev.d/*.nodes; do
+			if [ -f "$i" ]; then 			   
+				# use a little caching to speedup things
+				md5=$(/usr/bin/md5sum "$i"|(read a b; echo $a))
+				md5file="/var/lib/udev/makedev.d/${md5}.sh"
+
+				if [ ! -f "$md5file" ]; then
+					echo -n $STRING 
+					( sed -e 's,#.*,,g' "$i" | \
+						xargs $MAKEDEV -x -a -S ) \
+						> "$md5file"
+					rc=$?
+					if [ "$rc" -eq "0" ]; then
+					    success "$STRING"
+					    echo
+					elif [ "$rc" -eq "1" ]; then
+					    failure "$STRING"
+					    echo
+            				fi
+				fi
+			fi
+		done 
+	fi
+	rm -f /var/lock/subsys/udev-post
+	exit 0
+	;;
+  status)
+	exit 0
+	;;
+  *)
+        echo $"Usage: $0 {start|stop|reload}"
+        exit 2
+esac
+exit 0

@@ -1,0 +1,107 @@
+#! /bin/sh
+#
+# rpcbind       Start/Stop RPCbind
+#
+# chkconfig: 2345 13 87
+# description: The rpcbind utility is a server that converts RPC program \
+#              numbers into universal addresses. It must be running on the \
+#              host to be able to make RPC calls on a server on that machine.
+#
+# processname: rpcbind
+# probe: true
+# config: /etc/sysconfig/rpcbind
+
+
+# This is an interactive program, we need the current locale
+[ -f /etc/profile.d/lang.sh ] && . /etc/profile.d/lang.sh
+# We can't Japanese on normal console at boot time, so force LANG=C.
+if [ "$LANG" = "ja" -o "$LANG" = "ja_JP.eucJP" ]; then
+    if [ "$TERM" = "linux" ] ; then
+        LANG=C
+    fi
+fi
+
+# Source function library.
+. /etc/init.d/functions
+
+# Source networking configuration.
+[ -f /etc/sysconfig/network ] &&  . /etc/sysconfig/network
+
+prog="rpcbind"
+[ -f /etc/sysconfig/$prog ] && . /etc/sysconfig/$prog
+
+RETVAL=0
+uid=`id | cut -d\( -f1 | cut -d= -f2`
+
+start() {
+	# Check that networking is up.
+	[ "$NETWORKING" = "yes" ] || exit 6
+
+	[ -f /sbin/$prog ] || exit 5
+
+	# Make sure the rpcbind is not already running.
+	if status $prog > /dev/null ; then
+		exit 0	
+	fi
+
+	# Only root can start the service
+	[ $uid -ne 0 ] && exit 4
+
+	echo -n $"Starting $prog: "
+	daemon $prog $1 "$RPCBIND_ARGS"
+	RETVAL=$?
+	echo
+	if [ $RETVAL -eq 0 ] ; then
+		touch /var/lock/subsys/$prog
+		[ ! -f /var/run/rpcbind.pid ] &&
+			/sbin/pidof $prog > /var/run/rpcbind.pid
+	fi
+	return $RETVAL
+}
+
+
+stop() {
+	echo -n $"Stopping $prog: "
+	killproc $prog
+	RETVAL=$?
+	echo
+	[ $RETVAL -eq 0 ] && {
+		rm -f /var/lock/subsys/$prog
+		rm -f /var/run/rpcbind*
+	}
+	return $RETVAL
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	RETVAL=$?
+	;;
+  stop)
+	stop
+	RETVAL=$?
+	;;
+  status)
+	status $prog
+	RETVAL=$?
+	;;
+  restart | reload| force-reload)
+	stop
+	start
+	RETVAL=$?
+	;;
+  condrestart | try-restart)
+	if [ -f /var/lock/subsys/$prog ]; then
+		stop
+		start -w
+		RETVAL=$?
+	fi
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|status|restart|reload|force-reload|condrestart|try-restart}"
+	RETVAL=2
+	;;
+esac
+
+exit $RETVAL
